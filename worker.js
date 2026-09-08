@@ -1,12 +1,11 @@
-// Beach Fishing Radar — NOAA CO-OPS + NDBC + trends (YouTube + RSS) proxy
-// Tide/buoy routes are unchanged. New: /trends/youtube and /trends/rss.
-// The YouTube key lives in a Worker secret (env.YOUTUBE_API_KEY) — never
-// committed to the repo. RSS is a fixed allowlist, not an open proxy.
+// Beach Fishing Radar — NOAA CO-OPS + NDBC + trends (YouTube + RSS) + NWS precip proxy
+// Fetches everything server-side, adds CORS headers, returns clean JSON.
+// No storage. RSS sources and NWS stations are allowlisted, not arbitrary.
 
 const NOAA_BASE = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter";
 const NDBC_BASE = "https://www.ndbc.noaa.gov/data/realtime2";
-const NWS_BASE = "https://api.weather.gov";
 const YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search";
+const NWS_BASE = "https://api.weather.gov";
 
 // Allowlisted RSS sources only — never fetch an arbitrary client-supplied URL.
 const RSS_SOURCES = {
@@ -36,12 +35,11 @@ function validateNdbcStation(station) {
 function validateIcaoStation(station) {
   return typeof station === "string" && /^[A-Za-z]{4}$/.test(station);
 }
-
 function todayCompact(offsetDays = 0) {
   const d = new Date();
   d.setUTCDate(d.getUTCDate() + offsetDays);
   return d.toISOString().slice(0, 10).replace(/-/g, "");
-
+}
 
 async function fetchNoaa(params) {
   const qs = new URLSearchParams({ application: "BeachFishingRadarProxy", format: "json", units: "english", time_zone: "lst_ldt", ...params });
@@ -84,38 +82,6 @@ function parseNdbcStandardMet(text) {
   };
 }
 
-// NWS station observations include recent precipitation \u2014 a real,
-// measured input for estimating water clarity. Known limitation: this field
-// is sometimes null even during active rain (a gap in the source data
-// itself), reported as unavailable, never assumed to be zero.
-async function handlePrecip(station) {
-  const url = `${NWS_BASE}/stations/${station.toUpperCase()}/observations/latest`;
-  let res;
-  try {
-    res = await fetch(url, { headers: { "User-Agent": "BeachFishingRadarProxy (personal project)" } });
-  } catch (e) {
-    return jsonResponse({ error: `Could not reach NWS: ${e.message}` }, 502);
-  }
-  if (!res.ok) {
-    return jsonResponse({ error: `NWS returned HTTP ${res.status} for station ${station}` }, res.status === 404 ? 404 : 502);
-  }
-  let json;
-  try {
-    json = await res.json();
-  } catch {
-    return jsonResponse({ error: "NWS response was not valid JSON" }, 502);
-  }
-  const props = json.properties || {};
-  const metersToInches = (m) => (m == null ? null : m * 39.3701);
-  return jsonResponse({
-    station: station.toUpperCase(),
-    timestamp: props.timestamp || null,
-    precipLastHourIn: metersToInches(props.precipitationLastHour?.value),
-    precipLast3HoursIn: metersToInches(props.precipitationLast3Hours?.value),
-    precipLast6HoursIn: metersToInches(props.precipitationLast6Hours?.value),
-  });
-}
-
 async function handleBuoyLatest(station) {
   const url = `${NDBC_BASE}/${station}.txt`;
   let res;
@@ -127,7 +93,6 @@ async function handleBuoyLatest(station) {
   return jsonResponse({ station, ...parsed });
 }
 
-// YouTube: real videos only, sorted by recency, last ~21 days.
 async function handleYoutubeTrends(query, env) {
   if (!env.YOUTUBE_API_KEY) return jsonResponse({ error: "YouTube API key not configured on the server." }, 500);
   const publishedAfter = new Date(Date.now() - 21 * 24 * 3600 * 1000).toISOString();
@@ -152,9 +117,6 @@ async function handleYoutubeTrends(query, env) {
   return jsonResponse({ query, items });
 }
 
-// Minimal RSS/Atom parser \u2014 regex-based, good enough for standard feeds.
-// Not a general XML parser; feeds with unusual structure may fail to parse,
-// which is reported as an error, never silently skipped.
 function parseRss(xml) {
   const items = [];
   const itemBlocks = xml.match(/<item[\s\S]*?<\/item>/gi) || xml.match(/<entry[\s\S]*?<\/entry>/gi) || [];
@@ -188,6 +150,38 @@ async function handleRssTrends(sourceKey) {
   return jsonResponse({ source: sourceKey, sourceName: source.name, items });
 }
 
+// NWS station observations include recent precipitation — a real, measured
+// input for estimating water clarity. Known limitation: this field is
+// sometimes null even during active rain (a gap in the source data itself),
+// reported as unavailable, never assumed to be zero.
+async function handlePrecip(station) {
+  const url = `${NWS_BASE}/stations/${station.toUpperCase()}/observations/latest`;
+  let res;
+  try {
+    res = await fetch(url, { headers: { "User-Agent": "BeachFishingRadarProxy (personal project)" } });
+  } catch (e) {
+    return jsonResponse({ error: `Could not reach NWS: ${e.message}` }, 502);
+  }
+  if (!res.ok) {
+    return jsonResponse({ error: `NWS returned HTTP ${res.status} for station ${station}` }, res.status === 404 ? 404 : 502);
+  }
+  let json;
+  try {
+    json = await res.json();
+  } catch {
+    return jsonResponse({ error: "NWS response was not valid JSON" }, 502);
+  }
+  const props = json.properties || {};
+  const metersToInches = (m) => (m == null ? null : m * 39.3701);
+  return jsonResponse({
+    station: station.toUpperCase(),
+    timestamp: props.timestamp || null,
+    precipLastHourIn: metersToInches(props.precipitationLastHour?.value),
+    precipLast3HoursIn: metersToInches(props.precipitationLast3Hours?.value),
+    precipLast6HoursIn: metersToInches(props.precipitationLast6Hours?.value),
+  });
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
@@ -203,14 +197,14 @@ export default {
     }
 
     if (["/tides/current", "/tides/predictions", "/tides/curve"].includes(url.pathname)) {
-      if (!validateCoopsStation(station)) return jsonResponse({ error: "Missing or invalid 'station' \u2014 must be a 7-digit NOAA CO-OPS station ID." }, 400);
+      if (!validateCoopsStation(station)) return jsonResponse({ error: "Missing or invalid 'station' — must be a 7-digit NOAA CO-OPS station ID." }, 400);
       if (url.pathname === "/tides/current") return handleCurrent(station);
       if (url.pathname === "/tides/predictions") return handlePredictions(station);
       if (url.pathname === "/tides/curve") return handleCurve(station);
     }
 
     if (url.pathname === "/buoy/latest") {
-      if (!validateNdbcStation(station)) return jsonResponse({ error: "Missing or invalid 'station' \u2014 must be a valid NDBC station ID." }, 400);
+      if (!validateNdbcStation(station)) return jsonResponse({ error: "Missing or invalid 'station' — must be a valid NDBC station ID." }, 400);
       return handleBuoyLatest(station);
     }
 
@@ -225,9 +219,10 @@ export default {
       if (!source) return jsonResponse({ error: "Missing 'source' parameter." }, 400);
       return handleRssTrends(source);
     }
-        if (url.pathname === "/weather/precip") {
+
+    if (url.pathname === "/weather/precip") {
       if (!validateIcaoStation(station)) {
-        return jsonResponse({ error: "Missing or invalid 'station' \u2014 must be a 4-letter ICAO station ID (e.g. KMIA)." }, 400);
+        return jsonResponse({ error: "Missing or invalid 'station' — must be a 4-letter ICAO station ID (e.g. KMIA)." }, 400);
       }
       return handlePrecip(station);
     }
