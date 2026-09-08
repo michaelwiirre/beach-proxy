@@ -1,0 +1,3 @@
+name = "beach-fishing-radar-proxy"
+main = "worker.js"
+compatibility_date = "2026-09-01"
