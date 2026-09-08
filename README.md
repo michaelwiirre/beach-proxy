@@ -1,1 +1,1 @@
-# beach.proxy
+# beach-proxy
