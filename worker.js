@@ -7,7 +7,6 @@ const NDBC_BASE = "https://www.ndbc.noaa.gov/data/realtime2";
 const YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search";
 const NWS_BASE = "https://api.weather.gov";
 
-// Allowlisted RSS sources only — never fetch an arbitrary client-supplied URL.
 const RSS_SOURCES = {
   "snook-nook": { url: "https://snooknookfl.com/feed", name: "Snook Nook Bait & Tackle (Jensen Beach)" },
   "ponce-inlet": { url: "https://ponceinletcharters.com/2/feed", name: "Ponce Inlet Fishing Charters" },
@@ -58,11 +57,11 @@ async function handleCurrent(station) {
   return jsonResponse(r.body, r.status);
 }
 async function handlePredictions(station) {
-  const r = await fetchNoaa({ station, product: "predictions", datum: "MLLW", interval: "hilo", begin_date: todayCompact(0), end_date: todayCompact(2) });
+  const r = await fetchNoaa({ station, product: "predictions", datum: "MLLW", interval: "hilo", begin_date: todayCompact(-1), end_date: todayCompact(2) });
   return jsonResponse(r.body, r.status);
 }
 async function handleCurve(station) {
-  const r = await fetchNoaa({ station, product: "predictions", datum: "MLLW", interval: "h", begin_date: todayCompact(0), end_date: todayCompact(0) });
+  const r = await fetchNoaa({ station, product: "predictions", datum: "MLLW", interval: "h", begin_date: todayCompact(-1), end_date: todayCompact(1) });
   return jsonResponse(r.body, r.status);
 }
 
@@ -150,10 +149,6 @@ async function handleRssTrends(sourceKey) {
   return jsonResponse({ source: sourceKey, sourceName: source.name, items });
 }
 
-// NWS station observations include recent precipitation — a real, measured
-// input for estimating water clarity. Known limitation: this field is
-// sometimes null even during active rain (a gap in the source data itself),
-// reported as unavailable, never assumed to be zero.
 async function handlePrecip(station) {
   const url = `${NWS_BASE}/stations/${station.toUpperCase()}/observations/latest`;
   let res;
