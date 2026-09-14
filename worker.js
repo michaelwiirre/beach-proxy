@@ -1,6 +1,7 @@
-// Beach Fishing Radar — NOAA CO-OPS + NDBC + trends (YouTube + RSS) + NWS precip proxy
+// Beach Fishing Radar — NOAA CO-OPS + NDBC + trends (YouTube + RSS) + NWS precip + D1 trip logging
 // Fetches everything server-side, adds CORS headers, returns clean JSON.
-// No storage. RSS sources and NWS stations are allowlisted, not arbitrary.
+// RSS sources and NWS stations are allowlisted, not arbitrary. Trip logs
+// persist to D1 (TRIPS_DB binding) — the only write-capable route here.
 
 const NOAA_BASE = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter";
 const NDBC_BASE = "https://www.ndbc.noaa.gov/data/realtime2";
@@ -14,7 +15,7 @@ const RSS_SOURCES = {
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
@@ -177,6 +178,77 @@ async function handlePrecip(station) {
   });
 }
 
+// ---------------------------------------------------------------------
+// TRIP LOGGING — the only write-capable routes in this Worker. Every
+// logged trip freezes a snapshot of what the app predicted (score,
+// presence, feeding, access, position, live conditions) alongside what
+// actually happened, so predicted-vs-actual can be compared later.
+// ---------------------------------------------------------------------
+const VALID_OUTCOMES = ["caught", "hooked", "seen", "no_activity"];
+
+async function handleTripLog(request, env) {
+  if (!env.TRIPS_DB) return jsonResponse({ error: "Trips database is not bound to this Worker (TRIPS_DB binding missing)." }, 500);
+  let body;
+  try { body = await request.json(); } catch { return jsonResponse({ error: "Request body must be valid JSON." }, 400); }
+
+  for (const field of ["beach_id", "species_id", "outcome"]) {
+    if (!body[field]) return jsonResponse({ error: `Missing required field: ${field}` }, 400);
+  }
+  if (!VALID_OUTCOMES.includes(body.outcome)) {
+    return jsonResponse({ error: `outcome must be one of: ${VALID_OUTCOMES.join(", ")}` }, 400);
+  }
+
+  const now = new Date().toISOString();
+  const observedAt = body.observed_at || now;
+
+  try {
+    const result = await env.TRIPS_DB.prepare(
+      `INSERT INTO trip_logs (
+        beach_id, species_id, observed_at, logged_at, outcome, count, distance_yd_actual, notes,
+        predicted_score, predicted_presence, predicted_feeding, predicted_access, predicted_zone,
+        predicted_distance_min, predicted_distance_max, wave_ft, wind_kt, water_temp_f,
+        clarity_score, clarity_label, tide_direction, tide_flow_pct, bait_tier, bait_level
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      body.beach_id, body.species_id, observedAt, now, body.outcome,
+      body.count ?? null, body.distance_yd_actual ?? null, body.notes ?? null,
+      body.predicted_score ?? null, body.predicted_presence ?? null, body.predicted_feeding ?? null,
+      body.predicted_access ?? null, body.predicted_zone ?? null,
+      body.predicted_distance_min ?? null, body.predicted_distance_max ?? null,
+      body.wave_ft ?? null, body.wind_kt ?? null, body.water_temp_f ?? null,
+      body.clarity_score ?? null, body.clarity_label ?? null,
+      body.tide_direction ?? null, body.tide_flow_pct ?? null,
+      body.bait_tier ?? null, body.bait_level ?? null
+    ).run();
+    return jsonResponse({ ok: true, id: result.meta.last_row_id });
+  } catch (e) {
+    return jsonResponse({ error: `Database write failed: ${e.message}` }, 500);
+  }
+}
+
+async function handleTripList(url, env) {
+  if (!env.TRIPS_DB) return jsonResponse({ error: "Trips database is not bound to this Worker (TRIPS_DB binding missing)." }, 500);
+  const beachId = url.searchParams.get("beach_id");
+  const speciesId = url.searchParams.get("species_id");
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 200);
+
+  let query = "SELECT * FROM trip_logs";
+  const conditions = [];
+  const binds = [];
+  if (beachId) { conditions.push("beach_id = ?"); binds.push(beachId); }
+  if (speciesId) { conditions.push("species_id = ?"); binds.push(speciesId); }
+  if (conditions.length) query += " WHERE " + conditions.join(" AND ");
+  query += " ORDER BY observed_at DESC LIMIT ?";
+  binds.push(limit);
+
+  try {
+    const { results } = await env.TRIPS_DB.prepare(query).bind(...binds).all();
+    return jsonResponse({ trips: results });
+  } catch (e) {
+    return jsonResponse({ error: `Database read failed: ${e.message}` }, 500);
+  }
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
@@ -187,7 +259,7 @@ export default {
     if (url.pathname === "/") {
       return jsonResponse({
         ok: true,
-        routes: ["/tides/current?station=", "/tides/predictions?station=", "/tides/curve?station=", "/buoy/latest?station=", "/trends/youtube?query=", "/trends/rss?source=", "/weather/precip?station="],
+        routes: ["/tides/current?station=", "/tides/predictions?station=", "/tides/curve?station=", "/buoy/latest?station=", "/trends/youtube?query=", "/trends/rss?source=", "/weather/precip?station=", "/trips/log (POST)", "/trips/list?beach_id=&species_id=&limit="],
       });
     }
 
@@ -220,6 +292,15 @@ export default {
         return jsonResponse({ error: "Missing or invalid 'station' — must be a 4-letter ICAO station ID (e.g. KMIA)." }, 400);
       }
       return handlePrecip(station);
+    }
+
+    if (url.pathname === "/trips/log") {
+      if (request.method !== "POST") return jsonResponse({ error: "Use POST for /trips/log." }, 405);
+      return handleTripLog(request, env);
+    }
+
+    if (url.pathname === "/trips/list") {
+      return handleTripList(url, env);
     }
 
     return jsonResponse({ error: "Unknown route." }, 404);
