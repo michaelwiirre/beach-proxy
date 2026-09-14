@@ -206,4 +206,174 @@ async function handlePrecip(station) {
 // NWS keeps a real rolling observation history at this same base path
 // (no /latest) — returns a GeoJSON FeatureCollection. Known NWS API quirk:
 // results aren't always chronologically sorted, so we sort defensively
-// here rather than trust source
+// here rather than trust source order.
+async function handleWeatherHistory(station, dateCompact) {
+  const year = dateCompact.slice(0, 4), month = dateCompact.slice(4, 6), day = dateCompact.slice(6, 8);
+  const start = `${year}-${month}-${day}T00:00:00Z`;
+  const end = `${year}-${month}-${day}T23:59:59Z`;
+  const url = `${NWS_BASE}/stations/${station.toUpperCase()}/observations?start=${start}&end=${end}`;
+  let res;
+  try { res = await fetch(url, { headers: { "User-Agent": "BeachFishingRadarProxy (personal project)" } }); }
+  catch (e) { return jsonResponse({ error: `Could not reach NWS: ${e.message}` }, 502); }
+  if (!res.ok) return jsonResponse({ error: `NWS returned HTTP ${res.status} for station ${station}` }, res.status === 404 ? 404 : 502);
+  let json;
+  try { json = await res.json(); } catch { return jsonResponse({ error: "NWS response was not valid JSON" }, 502); }
+  const metersToInches = (m) => (m == null ? null : m * 39.3701);
+  const rows = (json.features || [])
+    .map((f) => ({
+      timestamp: f.properties?.timestamp,
+      precipLastHourIn: metersToInches(f.properties?.precipitationLastHour?.value),
+    }))
+    .filter((r) => r.timestamp)
+    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  return jsonResponse({ station: station.toUpperCase(), date: dateCompact, rows });
+}
+
+// ---------------------------------------------------------------------
+// TRIP LOGGING — normalized: one `trips` row per logging session (shared
+// conditions), many `trip_observations` rows (one per species/bait, with
+// independent sighted/bit/caught flags). The only write-capable routes.
+// ---------------------------------------------------------------------
+async function handleTripLog(request, env) {
+  if (!env.TRIPS_DB) return jsonResponse({ error: "Trips database is not bound to this Worker (TRIPS_DB binding missing)." }, 500);
+  let body;
+  try { body = await request.json(); } catch { return jsonResponse({ error: "Request body must be valid JSON." }, 400); }
+
+  for (const field of ["beach_id", "trip_date", "time_block", "observations"]) {
+    if (!body[field]) return jsonResponse({ error: `Missing required field: ${field}` }, 400);
+  }
+  if (!Array.isArray(body.observations) || body.observations.length === 0) {
+    return jsonResponse({ error: "observations must be a non-empty array." }, 400);
+  }
+
+  const now = new Date().toISOString();
+  try {
+    const tripResult = await env.TRIPS_DB.prepare(
+      `INSERT INTO trips (
+        beach_id, trip_date, time_block, observed_at, logged_at, notes,
+        wave_ft, wave_ft_source, wind_kt, wind_kt_source, water_temp_f, water_temp_f_source,
+        clarity_score, clarity_label, clarity_source, tide_direction, tide_flow_pct,
+        bait_tier, bait_level, moon_phase_name, moon_illumination_pct
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      body.beach_id, body.trip_date, body.time_block, body.observed_at ?? null, now, body.notes ?? null,
+      body.wave_ft ?? null, body.wave_ft_source ?? null, body.wind_kt ?? null, body.wind_kt_source ?? null,
+      body.water_temp_f ?? null, body.water_temp_f_source ?? null,
+      body.clarity_score ?? null, body.clarity_label ?? null, body.clarity_source ?? null,
+      body.tide_direction ?? null, body.tide_flow_pct ?? null,
+      body.bait_tier ?? null, body.bait_level ?? null,
+      body.moon_phase_name ?? null, body.moon_illumination_pct ?? null
+    ).run();
+    const tripId = tripResult.meta.last_row_id;
+
+    for (const obs of body.observations) {
+      if (!obs.subject_type || !obs.subject_id) continue;
+      await env.TRIPS_DB.prepare(
+        `INSERT INTO trip_observations (
+          trip_id, subject_type, subject_id, sighted, bit, caught, count, distance_yd_actual,
+          predicted_score, predicted_presence, predicted_feeding, predicted_access,
+          predicted_zone, predicted_distance_min, predicted_distance_max
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      ).bind(
+        tripId, obs.subject_type, obs.subject_id,
+        obs.sighted ? 1 : 0, obs.subject_type === "species" ? (obs.bit ? 1 : 0) : null, obs.caught ? 1 : 0,
+        obs.count ?? null, obs.distance_yd_actual ?? null,
+        obs.predicted_score ?? null, obs.predicted_presence ?? null, obs.predicted_feeding ?? null, obs.predicted_access ?? null,
+        obs.predicted_zone ?? null, obs.predicted_distance_min ?? null, obs.predicted_distance_max ?? null
+      ).run();
+    }
+    return jsonResponse({ ok: true, trip_id: tripId });
+  } catch (e) {
+    return jsonResponse({ error: `Database write failed: ${e.message}` }, 500);
+  }
+}
+
+async function handleTripList(url, env) {
+  if (!env.TRIPS_DB) return jsonResponse({ error: "Trips database is not bound to this Worker (TRIPS_DB binding missing)." }, 500);
+  const beachId = url.searchParams.get("beach_id");
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 200);
+  let query = "SELECT * FROM trips";
+  const binds = [];
+  if (beachId) { query += " WHERE beach_id = ?"; binds.push(beachId); }
+  query += " ORDER BY trip_date DESC, id DESC LIMIT ?";
+  binds.push(limit);
+  try {
+    const { results: trips } = await env.TRIPS_DB.prepare(query).bind(...binds).all();
+    for (const trip of trips) {
+      const { results: obs } = await env.TRIPS_DB.prepare("SELECT * FROM trip_observations WHERE trip_id = ?").bind(trip.id).all();
+      trip.observations = obs;
+    }
+    return jsonResponse({ trips });
+  } catch (e) {
+    return jsonResponse({ error: `Database read failed: ${e.message}` }, 500);
+  }
+}
+
+export default {
+  async fetch(request, env) {
+    if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
+    const url = new URL(request.url);
+    const station = url.searchParams.get("station");
+    const date = url.searchParams.get("date");
+
+    if (url.pathname === "/") {
+      return jsonResponse({
+        ok: true,
+        routes: [
+          "/tides/current?station=", "/tides/predictions?station=", "/tides/curve?station=",
+          "/tides/history?station=&date=YYYYMMDD",
+          "/buoy/latest?station=", "/buoy/history?station=&date=YYYYMMDD",
+          "/weather/precip?station=", "/weather/history?station=&date=YYYYMMDD",
+          "/trends/youtube?query=", "/trends/rss?source=",
+          "/trips/log (POST)", "/trips/list?beach_id=&limit=",
+        ],
+      });
+    }
+
+    if (["/tides/current", "/tides/predictions", "/tides/curve", "/tides/history"].includes(url.pathname)) {
+      if (!validateCoopsStation(station)) return jsonResponse({ error: "Missing or invalid 'station' \u2014 must be a 7-digit NOAA CO-OPS station ID." }, 400);
+      if (url.pathname === "/tides/current") return handleCurrent(station);
+      if (url.pathname === "/tides/predictions") return handlePredictions(station);
+      if (url.pathname === "/tides/curve") return handleCurve(station);
+      if (url.pathname === "/tides/history") {
+        if (!validateDateCompact(date)) return jsonResponse({ error: "Missing or invalid 'date' \u2014 must be YYYYMMDD." }, 400);
+        return handleTidesForDate(station, date);
+      }
+    }
+
+    if (url.pathname === "/buoy/latest" || url.pathname === "/buoy/history") {
+      if (!validateNdbcStation(station)) return jsonResponse({ error: "Missing or invalid 'station' \u2014 must be a valid NDBC station ID." }, 400);
+      if (url.pathname === "/buoy/latest") return handleBuoyLatest(station);
+      if (!validateDateCompact(date)) return jsonResponse({ error: "Missing or invalid 'date' \u2014 must be YYYYMMDD." }, 400);
+      return handleBuoyHistory(station, date);
+    }
+
+    if (url.pathname === "/trends/youtube") {
+      const query = url.searchParams.get("query");
+      if (!query || query.length < 3 || query.length > 100) return jsonResponse({ error: "Missing or invalid 'query' parameter." }, 400);
+      return handleYoutubeTrends(query, env);
+    }
+
+    if (url.pathname === "/trends/rss") {
+      const source = url.searchParams.get("source");
+      if (!source) return jsonResponse({ error: "Missing 'source' parameter." }, 400);
+      return handleRssTrends(source);
+    }
+
+    if (url.pathname === "/weather/precip" || url.pathname === "/weather/history") {
+      if (!validateIcaoStation(station)) return jsonResponse({ error: "Missing or invalid 'station' \u2014 must be a 4-letter ICAO station ID (e.g. KMIA)." }, 400);
+      if (url.pathname === "/weather/precip") return handlePrecip(station);
+      if (!validateDateCompact(date)) return jsonResponse({ error: "Missing or invalid 'date' \u2014 must be YYYYMMDD." }, 400);
+      return handleWeatherHistory(station, date);
+    }
+
+    if (url.pathname === "/trips/log") {
+      if (request.method !== "POST") return jsonResponse({ error: "Use POST for /trips/log." }, 405);
+      return handleTripLog(request, env);
+    }
+
+    if (url.pathname === "/trips/list") return handleTripList(url, env);
+
+    return jsonResponse({ error: "Unknown route." }, 404);
+  },
+};
