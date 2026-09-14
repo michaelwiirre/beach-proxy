@@ -1,6 +1,8 @@
 // Beach Fishing Radar — NOAA CO-OPS + NDBC + trends (YouTube + RSS) + NWS precip
 // + D1 trip logging + historical backfill (buoy/weather/tide history).
 // Fetches everything server-side, adds CORS headers, returns clean JSON.
+// RSS sources and NWS stations are allowlisted, not arbitrary. Trip logs
+// persist to D1 (TRIPS_DB binding) — the only write-capable route here.
 
 const NOAA_BASE = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter";
 const NDBC_BASE = "https://www.ndbc.noaa.gov/data/realtime2";
@@ -59,9 +61,6 @@ async function handleCurve(station) {
   const r = await fetchNoaa({ station, product: "predictions", datum: "MLLW", interval: "h", begin_date: todayCompact(-1), end_date: todayCompact(1) });
   return jsonResponse(r.body, r.status);
 }
-// Tide predictions are harmonic/deterministic, so "history" for any date
-// within reason is just the same predictions product, scoped to that date
-// (with a 1-day pad on each side so a request near midnight still resolves).
 async function handleTidesForDate(station, dateCompact) {
   const d = new Date(Date.UTC(+dateCompact.slice(0, 4), +dateCompact.slice(4, 6) - 1, +dateCompact.slice(6, 8)));
   const pad = (n) => { const x = new Date(d); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10).replace(/-/g, ""); };
@@ -84,10 +83,6 @@ function parseNdbcStandardMet(text) {
     waterTempC: num(WTMP), dewPointC: num(DEWP), visibilityNmi: num(VIS), pressureTendencyHpa: num(PTDY),
   };
 }
-
-// Parses EVERY row in the file (up to 45 days of history per NDBC's own
-// documentation), not just the newest one — this is what makes historical
-// backfill possible without a new external data source.
 function parseNdbcAllRows(text) {
   const lines = text.trim().split("\n").filter((l) => l.trim().length > 0);
   const rows = [];
@@ -118,9 +113,6 @@ async function handleBuoyLatest(station) {
   return jsonResponse({ station, ...parsed });
 }
 
-// Returns every row NDBC has for the requested UTC date — the client picks
-// the row nearest its desired time-block. NDBC only retains 45 days, so
-// requests older than that will legitimately come back empty.
 async function handleBuoyHistory(station, dateCompact) {
   const url = `${NDBC_BASE}/${station}.txt`;
   let res;
@@ -131,7 +123,7 @@ async function handleBuoyHistory(station, dateCompact) {
   const targetDatePrefix = `${dateCompact.slice(0, 4)}-${dateCompact.slice(4, 6)}-${dateCompact.slice(6, 8)}`;
   const dayRows = allRows.filter((r) => r.observedAtUtc.startsWith(targetDatePrefix));
   if (dayRows.length === 0) {
-    return jsonResponse({ station, date: dateCompact, rows: [], note: "No data for this date \u2014 NDBC's realtime2 file only retains ~45 days, or the buoy may have been offline." });
+    return jsonResponse({ station, date: dateCompact, rows: [], note: "No data for this date — NDBC's realtime2 file only retains ~45 days, or the buoy may have been offline." });
   }
   return jsonResponse({ station, date: dateCompact, rows: dayRows });
 }
@@ -203,10 +195,6 @@ async function handlePrecip(station) {
   });
 }
 
-// NWS keeps a real rolling observation history at this same base path
-// (no /latest) — returns a GeoJSON FeatureCollection. Known NWS API quirk:
-// results aren't always chronologically sorted, so we sort defensively
-// here rather than trust source order.
 async function handleWeatherHistory(station, dateCompact) {
   const year = dateCompact.slice(0, 4), month = dateCompact.slice(4, 6), day = dateCompact.slice(6, 8);
   const start = `${year}-${month}-${day}T00:00:00Z`;
@@ -220,10 +208,7 @@ async function handleWeatherHistory(station, dateCompact) {
   try { json = await res.json(); } catch { return jsonResponse({ error: "NWS response was not valid JSON" }, 502); }
   const metersToInches = (m) => (m == null ? null : m * 39.3701);
   const rows = (json.features || [])
-    .map((f) => ({
-      timestamp: f.properties?.timestamp,
-      precipLastHourIn: metersToInches(f.properties?.precipitationLastHour?.value),
-    }))
+    .map((f) => ({ timestamp: f.properties?.timestamp, precipLastHourIn: metersToInches(f.properties?.precipitationLastHour?.value) }))
     .filter((r) => r.timestamp)
     .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
   return jsonResponse({ station: station.toUpperCase(), date: dateCompact, rows });
@@ -231,8 +216,12 @@ async function handleWeatherHistory(station, dateCompact) {
 
 // ---------------------------------------------------------------------
 // TRIP LOGGING — normalized: one `trips` row per logging session (shared
-// conditions), many `trip_observations` rows (one per species/bait, with
-// independent sighted/bit/caught flags). The only write-capable routes.
+// conditions + source tags per input), many `trip_observations` rows (one
+// per species/bait, each an immutable prediction snapshot: score,
+// presence/feeding/access, model_version, confidence, positive/limiting
+// factors, plus whatever was actually observed). The only write-capable
+// routes here — every write is a pure INSERT, never an UPDATE, which is
+// what makes existing snapshots immutable by construction.
 // ---------------------------------------------------------------------
 async function handleTripLog(request, env) {
   if (!env.TRIPS_DB) return jsonResponse({ error: "Trips database is not bound to this Worker (TRIPS_DB binding missing)." }, 500);
@@ -251,18 +240,20 @@ async function handleTripLog(request, env) {
     const tripResult = await env.TRIPS_DB.prepare(
       `INSERT INTO trips (
         beach_id, trip_date, time_block, observed_at, logged_at, notes,
-        wave_ft, wave_ft_source, wind_kt, wind_kt_source, water_temp_f, water_temp_f_source,
-        clarity_score, clarity_label, clarity_source, tide_direction, tide_flow_pct,
-        bait_tier, bait_level, moon_phase_name, moon_illumination_pct
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        wave_ft, wave_ft_source, wave_period_s, wind_kt, wind_kt_source, wind_dir_deg,
+        water_temp_f, water_temp_f_source,
+        clarity_score, clarity_label, clarity_source, tide_direction, tide_flow_pct, tide_source,
+        bait_tier, bait_level, bait_source, moon_phase_name, moon_illumination_pct, moon_source
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
       body.beach_id, body.trip_date, body.time_block, body.observed_at ?? null, now, body.notes ?? null,
-      body.wave_ft ?? null, body.wave_ft_source ?? null, body.wind_kt ?? null, body.wind_kt_source ?? null,
+      body.wave_ft ?? null, body.wave_ft_source ?? null, body.wave_period_s ?? null,
+      body.wind_kt ?? null, body.wind_kt_source ?? null, body.wind_dir_deg ?? null,
       body.water_temp_f ?? null, body.water_temp_f_source ?? null,
       body.clarity_score ?? null, body.clarity_label ?? null, body.clarity_source ?? null,
-      body.tide_direction ?? null, body.tide_flow_pct ?? null,
-      body.bait_tier ?? null, body.bait_level ?? null,
-      body.moon_phase_name ?? null, body.moon_illumination_pct ?? null
+      body.tide_direction ?? null, body.tide_flow_pct ?? null, body.tide_source ?? null,
+      body.bait_tier ?? null, body.bait_level ?? null, body.bait_source ?? null,
+      body.moon_phase_name ?? null, body.moon_illumination_pct ?? null, body.moon_source ?? null
     ).run();
     const tripId = tripResult.meta.last_row_id;
 
@@ -272,14 +263,16 @@ async function handleTripLog(request, env) {
         `INSERT INTO trip_observations (
           trip_id, subject_type, subject_id, sighted, bit, caught, count, distance_yd_actual,
           predicted_score, predicted_presence, predicted_feeding, predicted_access,
-          predicted_zone, predicted_distance_min, predicted_distance_max
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+          predicted_zone, predicted_distance_min, predicted_distance_max,
+          model_version, confidence, major_positive_factors, major_limiting_factors
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       ).bind(
         tripId, obs.subject_type, obs.subject_id,
         obs.sighted ? 1 : 0, obs.subject_type === "species" ? (obs.bit ? 1 : 0) : null, obs.caught ? 1 : 0,
         obs.count ?? null, obs.distance_yd_actual ?? null,
         obs.predicted_score ?? null, obs.predicted_presence ?? null, obs.predicted_feeding ?? null, obs.predicted_access ?? null,
-        obs.predicted_zone ?? null, obs.predicted_distance_min ?? null, obs.predicted_distance_max ?? null
+        obs.predicted_zone ?? null, obs.predicted_distance_min ?? null, obs.predicted_distance_max ?? null,
+        obs.model_version ?? null, obs.confidence ?? null, obs.major_positive_factors ?? null, obs.major_limiting_factors ?? null
       ).run();
     }
     return jsonResponse({ ok: true, trip_id: tripId });
@@ -331,20 +324,20 @@ export default {
     }
 
     if (["/tides/current", "/tides/predictions", "/tides/curve", "/tides/history"].includes(url.pathname)) {
-      if (!validateCoopsStation(station)) return jsonResponse({ error: "Missing or invalid 'station' \u2014 must be a 7-digit NOAA CO-OPS station ID." }, 400);
+      if (!validateCoopsStation(station)) return jsonResponse({ error: "Missing or invalid 'station' — must be a 7-digit NOAA CO-OPS station ID." }, 400);
       if (url.pathname === "/tides/current") return handleCurrent(station);
       if (url.pathname === "/tides/predictions") return handlePredictions(station);
       if (url.pathname === "/tides/curve") return handleCurve(station);
       if (url.pathname === "/tides/history") {
-        if (!validateDateCompact(date)) return jsonResponse({ error: "Missing or invalid 'date' \u2014 must be YYYYMMDD." }, 400);
+        if (!validateDateCompact(date)) return jsonResponse({ error: "Missing or invalid 'date' — must be YYYYMMDD." }, 400);
         return handleTidesForDate(station, date);
       }
     }
 
     if (url.pathname === "/buoy/latest" || url.pathname === "/buoy/history") {
-      if (!validateNdbcStation(station)) return jsonResponse({ error: "Missing or invalid 'station' \u2014 must be a valid NDBC station ID." }, 400);
+      if (!validateNdbcStation(station)) return jsonResponse({ error: "Missing or invalid 'station' — must be a valid NDBC station ID." }, 400);
       if (url.pathname === "/buoy/latest") return handleBuoyLatest(station);
-      if (!validateDateCompact(date)) return jsonResponse({ error: "Missing or invalid 'date' \u2014 must be YYYYMMDD." }, 400);
+      if (!validateDateCompact(date)) return jsonResponse({ error: "Missing or invalid 'date' — must be YYYYMMDD." }, 400);
       return handleBuoyHistory(station, date);
     }
 
@@ -361,9 +354,9 @@ export default {
     }
 
     if (url.pathname === "/weather/precip" || url.pathname === "/weather/history") {
-      if (!validateIcaoStation(station)) return jsonResponse({ error: "Missing or invalid 'station' \u2014 must be a 4-letter ICAO station ID (e.g. KMIA)." }, 400);
+      if (!validateIcaoStation(station)) return jsonResponse({ error: "Missing or invalid 'station' — must be a 4-letter ICAO station ID (e.g. KMIA)." }, 400);
       if (url.pathname === "/weather/precip") return handlePrecip(station);
-      if (!validateDateCompact(date)) return jsonResponse({ error: "Missing or invalid 'date' \u2014 must be YYYYMMDD." }, 400);
+      if (!validateDateCompact(date)) return jsonResponse({ error: "Missing or invalid 'date' — must be YYYYMMDD." }, 400);
       return handleWeatherHistory(station, date);
     }
 
