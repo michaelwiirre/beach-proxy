@@ -1,8 +1,10 @@
 // Beach Fishing Radar — NOAA CO-OPS + NDBC + trends (YouTube + RSS) + NWS precip
-// + D1 trip logging + historical backfill (buoy/weather/tide history).
-// Fetches everything server-side, adds CORS headers, returns clean JSON.
-// RSS sources and NWS stations are allowlisted, not arbitrary. Trip logs
-// persist to D1 (TRIPS_DB binding) — the only write-capable route here.
+// + NWS forecast gridpoints + D1 trip logging + historical backfill +
+// immutable prediction snapshots. Fetches everything server-side, adds CORS
+// headers, returns clean JSON. RSS sources and NWS stations are allowlisted,
+// not arbitrary. Trip logs and prediction snapshots persist to D1
+// (TRIPS_DB binding) — the only write-capable routes here, and both are
+// pure INSERT, never UPDATE.
 
 const NOAA_BASE = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter";
 const NDBC_BASE = "https://www.ndbc.noaa.gov/data/realtime2";
@@ -215,13 +217,66 @@ async function handleWeatherHistory(station, dateCompact) {
 }
 
 // ---------------------------------------------------------------------
+// FORECAST (Priority 10) — resolves lat/lon to an NWS gridpoint, then
+// returns the raw gridpoint layers our model can use, exactly as NWS
+// reports them (no unit conversion, no interpolation — that's the
+// client's job, same division of labor as every other route here).
+// Fully defensive: a field simply won't be in the response if that
+// forecast office hasn't populated it — never inferred, never faked.
+// ---------------------------------------------------------------------
+const FORECAST_FIELDS = [
+  "windSpeed", "windDirection", "windGust",
+  "waveHeight", "wavePeriod", "waveDirection",
+  "primarySwellHeight", "primarySwellDirection", "windWaveHeight",
+  "probabilityOfPrecipitation", "quantitativePrecipitation", "pressure",
+];
+
+async function handleForecastGridpoint(lat, lon) {
+  let pointsRes;
+  try {
+    pointsRes = await fetch(`https://api.weather.gov/points/${lat},${lon}`, { headers: { "User-Agent": "BeachFishingRadarProxy (personal project)" } });
+  } catch (e) {
+    return jsonResponse({ error: `Could not reach NWS points lookup: ${e.message}` }, 502);
+  }
+  if (!pointsRes.ok) return jsonResponse({ error: `NWS points lookup returned HTTP ${pointsRes.status}` }, pointsRes.status === 404 ? 404 : 502);
+  let pointsJson;
+  try { pointsJson = await pointsRes.json(); } catch { return jsonResponse({ error: "NWS points response was not valid JSON" }, 502); }
+  const gridDataUrl = pointsJson.properties?.forecastGridData;
+  const gridId = pointsJson.properties?.gridId, gridX = pointsJson.properties?.gridX, gridY = pointsJson.properties?.gridY;
+  if (!gridDataUrl) return jsonResponse({ error: "NWS did not return a gridpoint for this location" }, 502);
+
+  let gridRes;
+  try {
+    gridRes = await fetch(gridDataUrl, { headers: { "User-Agent": "BeachFishingRadarProxy (personal project)" } });
+  } catch (e) {
+    return jsonResponse({ error: `Could not reach NWS gridpoint data: ${e.message}` }, 502);
+  }
+  if (!gridRes.ok) return jsonResponse({ error: `NWS gridpoint returned HTTP ${gridRes.status}` }, 502);
+  let gridJson;
+  try { gridJson = await gridRes.json(); } catch { return jsonResponse({ error: "NWS gridpoint response was not valid JSON" }, 502); }
+
+  const props = gridJson.properties || {};
+  const layers = {};
+  for (const field of FORECAST_FIELDS) {
+    if (props[field]?.values?.length) {
+      layers[field] = { uom: props[field].uom || null, values: props[field].values };
+    }
+  }
+  return jsonResponse({
+    gridId, gridX, gridY,
+    updateTime: props.updateTime || null,
+    layers,
+    fieldsPopulated: Object.keys(layers),
+    fieldsRequested: FORECAST_FIELDS,
+  });
+}
+
+// ---------------------------------------------------------------------
 // TRIP LOGGING — normalized: one `trips` row per logging session (shared
 // conditions + source tags per input), many `trip_observations` rows (one
 // per species/bait, each an immutable prediction snapshot: score,
 // presence/feeding/access, model_version, confidence, positive/limiting
-// factors, plus whatever was actually observed). The only write-capable
-// routes here — every write is a pure INSERT, never an UPDATE, which is
-// what makes existing snapshots immutable by construction.
+// factors, plus whatever was actually observed). Pure INSERT, never UPDATE.
 // ---------------------------------------------------------------------
 async function handleTripLog(request, env) {
   if (!env.TRIPS_DB) return jsonResponse({ error: "Trips database is not bound to this Worker (TRIPS_DB binding missing)." }, 500);
@@ -302,6 +357,77 @@ async function handleTripList(url, env) {
   }
 }
 
+// ---------------------------------------------------------------------
+// PREDICTION SNAPSHOTS — a standalone immutable record of what the model
+// predicted, independent of whether any fishing outcome was ever logged.
+// Pure INSERT, never UPDATE — a re-saved prediction (e.g. after a model
+// version bump, or a future-vs-past re-evaluation) always creates a new
+// row, never touches an old one.
+// ---------------------------------------------------------------------
+async function handleSnapshotSave(request, env) {
+  if (!env.TRIPS_DB) return jsonResponse({ error: "Trips database is not bound to this Worker (TRIPS_DB binding missing)." }, 500);
+  let body;
+  try { body = await request.json(); } catch { return jsonResponse({ error: "Request body must be valid JSON." }, 400); }
+
+  for (const field of ["beach_id", "species_id", "prediction_timestamp", "retrieved_at", "model_version"]) {
+    if (!body[field]) return jsonResponse({ error: `Missing required field: ${field}` }, 400);
+  }
+
+  try {
+    const result = await env.TRIPS_DB.prepare(
+      `INSERT INTO prediction_snapshots (
+        beach_id, species_id, prediction_timestamp, retrieved_at, model_version,
+        presence, feeding, access, final_score, confidence,
+        predicted_zone, predicted_distance_min, predicted_distance_max,
+        wave_ft, wave_ft_source, wave_period_s, wind_kt, wind_kt_source, wind_dir_deg,
+        water_temp_f, water_temp_f_source,
+        clarity_score, clarity_label, clarity_source, tide_direction, tide_flow_pct, tide_source,
+        bait_tier, bait_level, bait_source, bait_dominant_type, bait_freshness_tier, bait_observed_at_utc, bait_forage_strength,
+        moon_phase_name, moon_illumination_pct, moon_source,
+        is_future, forecast_grid_id, forecast_grid_x, forecast_grid_y, forecast_update_time,
+        major_positive_factors, major_limiting_factors
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      body.beach_id, body.species_id, body.prediction_timestamp, body.retrieved_at, body.model_version,
+      body.presence ?? null, body.feeding ?? null, body.access ?? null, body.final_score ?? null, body.confidence ?? null,
+      body.predicted_zone ?? null, body.predicted_distance_min ?? null, body.predicted_distance_max ?? null,
+      body.wave_ft ?? null, body.wave_ft_source ?? null, body.wave_period_s ?? null,
+      body.wind_kt ?? null, body.wind_kt_source ?? null, body.wind_dir_deg ?? null,
+      body.water_temp_f ?? null, body.water_temp_f_source ?? null,
+      body.clarity_score ?? null, body.clarity_label ?? null, body.clarity_source ?? null,
+      body.tide_direction ?? null, body.tide_flow_pct ?? null, body.tide_source ?? null,
+      body.bait_tier ?? null, body.bait_level ?? null, body.bait_source ?? null,
+      body.bait_dominant_type ?? null, body.bait_freshness_tier ?? null, body.bait_observed_at_utc ?? null, body.bait_forage_strength ?? null,
+      body.moon_phase_name ?? null, body.moon_illumination_pct ?? null, body.moon_source ?? null,
+      body.is_future ?? null, body.forecast_grid_id ?? null, body.forecast_grid_x ?? null, body.forecast_grid_y ?? null, body.forecast_update_time ?? null,
+      body.major_positive_factors ?? null, body.major_limiting_factors ?? null
+    ).run();
+    return jsonResponse({ ok: true, snapshot_id: result.meta.last_row_id });
+  } catch (e) {
+    return jsonResponse({ error: `Database write failed: ${e.message}` }, 500);
+  }
+}
+
+async function handleSnapshotList(url, env) {
+  if (!env.TRIPS_DB) return jsonResponse({ error: "Trips database is not bound to this Worker (TRIPS_DB binding missing)." }, 500);
+  const beachId = url.searchParams.get("beach_id");
+  const speciesId = url.searchParams.get("species_id");
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 200);
+  let query = "SELECT * FROM prediction_snapshots";
+  const conditions = [], binds = [];
+  if (beachId) { conditions.push("beach_id = ?"); binds.push(beachId); }
+  if (speciesId) { conditions.push("species_id = ?"); binds.push(speciesId); }
+  if (conditions.length) query += " WHERE " + conditions.join(" AND ");
+  query += " ORDER BY id DESC LIMIT ?";
+  binds.push(limit);
+  try {
+    const { results } = await env.TRIPS_DB.prepare(query).bind(...binds).all();
+    return jsonResponse({ snapshots: results });
+  } catch (e) {
+    return jsonResponse({ error: `Database read failed: ${e.message}` }, 500);
+  }
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
@@ -317,8 +443,10 @@ export default {
           "/tides/history?station=&date=YYYYMMDD",
           "/buoy/latest?station=", "/buoy/history?station=&date=YYYYMMDD",
           "/weather/precip?station=", "/weather/history?station=&date=YYYYMMDD",
+          "/forecast/gridpoint?lat=&lon=",
           "/trends/youtube?query=", "/trends/rss?source=",
           "/trips/log (POST)", "/trips/list?beach_id=&limit=",
+          "/snapshots/save (POST)", "/snapshots/list?beach_id=&species_id=&limit=",
         ],
       });
     }
@@ -339,6 +467,12 @@ export default {
       if (url.pathname === "/buoy/latest") return handleBuoyLatest(station);
       if (!validateDateCompact(date)) return jsonResponse({ error: "Missing or invalid 'date' — must be YYYYMMDD." }, 400);
       return handleBuoyHistory(station, date);
+    }
+
+    if (url.pathname === "/forecast/gridpoint") {
+      const lat = url.searchParams.get("lat"), lon = url.searchParams.get("lon");
+      if (!lat || !lon || isNaN(+lat) || isNaN(+lon)) return jsonResponse({ error: "Missing or invalid 'lat'/'lon'." }, 400);
+      return handleForecastGridpoint(lat, lon);
     }
 
     if (url.pathname === "/trends/youtube") {
@@ -364,8 +498,13 @@ export default {
       if (request.method !== "POST") return jsonResponse({ error: "Use POST for /trips/log." }, 405);
       return handleTripLog(request, env);
     }
-
     if (url.pathname === "/trips/list") return handleTripList(url, env);
+
+    if (url.pathname === "/snapshots/save") {
+      if (request.method !== "POST") return jsonResponse({ error: "Use POST for /snapshots/save." }, 405);
+      return handleSnapshotSave(request, env);
+    }
+    if (url.pathname === "/snapshots/list") return handleSnapshotList(url, env);
 
     return jsonResponse({ error: "Unknown route." }, 404);
   },
