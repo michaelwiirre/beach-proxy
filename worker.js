@@ -293,23 +293,25 @@ async function handleTripLog(request, env) {
   const now = new Date().toISOString();
   try {
     const tripResult = await env.TRIPS_DB.prepare(
-      `INSERT INTO trips (
-        beach_id, trip_date, time_block, observed_at, logged_at, notes,
-        wave_ft, wave_ft_source, wave_period_s, wind_kt, wind_kt_source, wind_dir_deg,
-        water_temp_f, water_temp_f_source,
-        clarity_score, clarity_label, clarity_source, tide_direction, tide_flow_pct, tide_source,
-        bait_tier, bait_level, bait_source, moon_phase_name, moon_illumination_pct, moon_source
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-    ).bind(
-      body.beach_id, body.trip_date, body.time_block, body.observed_at ?? null, now, body.notes ?? null,
-      body.wave_ft ?? null, body.wave_ft_source ?? null, body.wave_period_s ?? null,
-      body.wind_kt ?? null, body.wind_kt_source ?? null, body.wind_dir_deg ?? null,
-      body.water_temp_f ?? null, body.water_temp_f_source ?? null,
-      body.clarity_score ?? null, body.clarity_label ?? null, body.clarity_source ?? null,
-      body.tide_direction ?? null, body.tide_flow_pct ?? null, body.tide_source ?? null,
-      body.bait_tier ?? null, body.bait_level ?? null, body.bait_source ?? null,
-      body.moon_phase_name ?? null, body.moon_illumination_pct ?? null, body.moon_source ?? null
-    ).run();
+  `INSERT INTO trips (
+    beach_id, trip_date, time_block, observed_at, logged_at, notes,
+    wave_ft, wave_ft_source, wave_period_s, wind_kt, wind_kt_source, wind_dir_deg,
+    water_temp_f, water_temp_f_source,
+    clarity_score, clarity_label, clarity_source, tide_direction, tide_flow_pct, tide_source,
+    bait_tier, bait_level, bait_source, moon_phase_name, moon_illumination_pct, moon_source,
+    effort_minutes, observed_clarity, method, observed_surf
+  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+).bind(
+  body.beach_id, body.trip_date, body.time_block, body.observed_at ?? null, now, body.notes ?? null,
+  body.wave_ft ?? null, body.wave_ft_source ?? null, body.wave_period_s ?? null,
+  body.wind_kt ?? null, body.wind_kt_source ?? null, body.wind_dir_deg ?? null,
+  body.water_temp_f ?? null, body.water_temp_f_source ?? null,
+  body.clarity_score ?? null, body.clarity_label ?? null, body.clarity_source ?? null,
+  body.tide_direction ?? null, body.tide_flow_pct ?? null, body.tide_source ?? null,
+  body.bait_tier ?? null, body.bait_level ?? null, body.bait_source ?? null,
+  body.moon_phase_name ?? null, body.moon_illumination_pct ?? null, body.moon_source ?? null,
+  body.effort_minutes ?? null, body.observed_clarity ?? null, body.method ?? null, body.observed_surf ?? null
+).run();
     const tripId = tripResult.meta.last_row_id;
 
     for (const obs of body.observations) {
