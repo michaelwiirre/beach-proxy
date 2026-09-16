@@ -3,3 +3,11 @@ main = "worker.js"
 compatibility_date = "2026-09-01"
 [triggers]
 crons = ["0 */6 * * *"]
+name = "beach-proxy"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+[[d1_databases]]
+binding = "TRIPS_DB"
+database_name = "beach-fishing-trips"
+database_id = "TRIPS_DB"
