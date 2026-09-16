@@ -457,16 +457,13 @@ async function recordSourceFailure(env, sourceId, reason) {
     .bind(forageNow(), forageNow(), reason, sourceId).run();
 }
 function requireForageAuth(request, env) {
+  const url = new URL(request.url);
   const header = request.headers.get("Authorization") || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  const headerToken = header.startsWith("Bearer ") ? header.slice(7) : null;
+  const queryToken = url.searchParams.get("token"); // TEMPORARY testing accommodation -- remove once a proper tool works
+  const token = headerToken || queryToken;
   if (!env.FORAGE_DEV_TOKEN || token !== env.FORAGE_DEV_TOKEN) {
-    return jsonResponse({
-      error: "Unauthorized.",
-      debug_secretIsConfigured: !!env.FORAGE_DEV_TOKEN,
-      debug_secretLength: env.FORAGE_DEV_TOKEN ? env.FORAGE_DEV_TOKEN.length : 0,
-      debug_tokenReceivedLength: token ? token.length : 0,
-      debug_headerReceived: header ? header.slice(0, 15) + "..." : "(no Authorization header received at all)",
-    }, 401);
+    return jsonResponse({ error: "Unauthorized. Pass 'Authorization: Bearer <FORAGE_DEV_TOKEN>' or '?token=<FORAGE_DEV_TOKEN>'." }, 401);
   }
   return null;
 }
