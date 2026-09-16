@@ -459,9 +459,18 @@ async function recordSourceFailure(env, sourceId, reason) {
 function requireForageAuth(request, env) {
   const header = request.headers.get("Authorization") || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-  if (!env.FORAGE_DEV_TOKEN || token !== env.FORAGE_DEV_TOKEN) return jsonResponse({ error: "Unauthorized. Pass 'Authorization: Bearer <FORAGE_DEV_TOKEN>'." }, 401);
+  if (!env.FORAGE_DEV_TOKEN || token !== env.FORAGE_DEV_TOKEN) {
+    return jsonResponse({
+      error: "Unauthorized.",
+      debug_secretIsConfigured: !!env.FORAGE_DEV_TOKEN,
+      debug_secretLength: env.FORAGE_DEV_TOKEN ? env.FORAGE_DEV_TOKEN.length : 0,
+      debug_tokenReceivedLength: token ? token.length : 0,
+      debug_headerReceived: header ? header.slice(0, 15) + "..." : "(no Authorization header received at all)",
+    }, 401);
+  }
   return null;
 }
+
 
 // --- HTML parsing helpers (attribute-order/quote-style independent) ---
 function findAnchors(html, hrefPrefix) {
