@@ -713,6 +713,100 @@ async function extractPendingArticles(env, limit = 10) {
   }
   return { processed, checked: pending.length };
 }
+// ===========================================================================
+// PUBLIC FORAGE EVIDENCE ENDPOINT (Priority 13 informational surface) —
+// read-only, no auth required. Returns only display-ready, already-
+// eligibility-filtered evidence: never raw debug tables, reviewer notes,
+// or raw LLM output. This is intentionally the ONLY place region mapping
+// and eligibility rules live -- the app itself trusts this endpoint's
+// output completely rather than re-deriving any of this logic client-side.
+// ===========================================================================
+
+// Conservative, explicit beach -> region mapping. This is my own reasoned
+// judgment call, not empirically verified against real coastal boundaries
+// -- flagged honestly. Any beach NOT listed here is genuinely unsupported;
+// never falls back to "nearest region" (item 2's explicit requirement).
+const FORAGE_BEACH_REGION_MAP = {
+  "cocoa-beach": "space-coast",
+  "melbourne-beach": "space-coast",
+  "vero-beach": "sebastian",
+  "fort-pierce": "sebastian",
+  "juno-beach": "palm-beach-north",
+  "jupiter-beach": "palm-beach-north",
+  "palm-beach": "palm-beach-north",
+};
+const FORAGE_REGION_DISPLAY_NAMES = { "space-coast": "Space Coast", "sebastian": "Sebastian", "palm-beach-north": "Palm Beach North" };
+const FORAGE_SOURCE_DISPLAY_NAMES = { spacefish: "Spacefish", sitd: "Sebastian Inlet District", junobait: "Juno Bait" };
+
+function computeForageFreshnessLabel(publishedAt) {
+  if (!publishedAt) return null;
+  const hrs = (Date.now() - new Date(publishedAt).getTime()) / 3600000;
+  if (hrs < 0 || hrs > 168) return null; // future or >7 days old -> never presented as current (item 3)
+  if (hrs < 1) return "reported under 1h ago";
+  if (hrs <= 48) return `reported ${Math.round(hrs)}h ago`;
+  return `reported ${Math.round(hrs / 24)} days ago`;
+}
+
+async function handleForageEvidence(url, env) {
+  const beachId = url.searchParams.get("beachId");
+  if (!beachId) return jsonResponse({ error: "beachId required" }, 400);
+
+  const regionId = FORAGE_BEACH_REGION_MAP[beachId];
+  if (!regionId) return jsonResponse({ supported: false, evidence: [] });
+
+  const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+  const { results } = await env.TRIPS_DB.prepare(`
+    SELECT e.id, e.forage_type, e.presence, e.concentration, e.movement, e.trend,
+           e.location_text, e.supporting_quote, e.extraction_confidence,
+           a.article_url, a.published_at, a.source_id,
+           rv.overall_correct, rv.truth_forage_type, rv.truth_presence, rv.truth_concentration,
+           rv.truth_movement, rv.truth_trend, rv.truth_location_text, rv.truth_supporting_quote
+    FROM forage_extractions e
+    JOIN forage_article_revisions rev ON e.article_revision_id = rev.id
+    JOIN forage_source_articles a ON rev.article_id = a.id
+    LEFT JOIN forage_extraction_reviews rv ON rv.extraction_id = e.id
+    WHERE e.region_id = ?
+      AND e.schema_valid = 1 AND e.quote_valid = 1
+      AND e.temporal_scope = 'current_or_recent'
+      AND e.extraction_confidence IN ('high', 'moderate')
+      AND a.published_at IS NOT NULL AND a.published_at >= ?
+    ORDER BY a.published_at DESC
+  `).bind(regionId, sevenDaysAgo).all();
+
+  const seen = new Set();
+  const evidence = [];
+  for (const row of results) {
+    // Human review precedence (item 9): incorrect + no usable correction -> hide entirely.
+    if (row.overall_correct === 0 && !row.truth_forage_type) continue;
+    const useTruth = row.overall_correct === 0;
+
+    const forageType = useTruth ? row.truth_forage_type : row.forage_type;
+    const presence = useTruth ? row.truth_presence : row.presence;
+    const concentration = useTruth ? row.truth_concentration : row.concentration;
+    const movement = useTruth ? row.truth_movement : row.movement;
+    const trend = useTruth ? row.truth_trend : row.trend;
+    const locationText = useTruth ? row.truth_location_text : row.location_text;
+    const quote = useTruth ? (row.truth_supporting_quote || row.supporting_quote) : row.supporting_quote;
+
+    const dedupeKey = `${row.article_url}|${forageType}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    const freshnessLabel = computeForageFreshnessLabel(row.published_at);
+    if (!freshnessLabel) continue;
+
+    evidence.push({
+      forageType, presence, concentration, movement, trend, locationText,
+      supportingQuote: quote,
+      sourceName: FORAGE_SOURCE_DISPLAY_NAMES[row.source_id] || row.source_id,
+      region: FORAGE_REGION_DISPLAY_NAMES[regionId] || regionId,
+      publishedAt: row.published_at,
+      freshnessLabel,
+      articleUrl: row.article_url,
+    });
+  }
+  return jsonResponse({ supported: true, regionId, evidence: evidence.slice(0, 10) });
+}
 
 // --- Route handlers ---
 async function handleForageCheckSources(env) {
@@ -955,6 +1049,7 @@ if (url.pathname === "/forage/check-sources") { return handleForageCheckSources(
     if (url.pathname === "/forage/review/submit") { if (request.method !== "POST") return jsonResponse({ error: "POST only" }, 405); return handleForageSubmitReview(request, env); }
     if (url.pathname === "/forage/review/mark-fully-reviewed") { if (request.method !== "POST") return jsonResponse({ error: "POST only" }, 405); return handleForageMarkFullyReviewed(request, env); }
     if (url.pathname === "/forage/metrics") return handleForageMetrics(env, url);
+    if (url.pathname === "/forage/evidence") return handleForageEvidence(url, env);
 
     return jsonResponse({ error: "Unknown route." }, 404);
   },
