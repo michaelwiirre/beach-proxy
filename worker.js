@@ -520,8 +520,18 @@ function resolveUrl(maybeRelative, baseUrl) { try { return new URL(maybeRelative
 function extractSpacefishArticle(html) {
   const publishedAt = findMetaContent(html, "article:published_time") || findMetaContent(html, "og:updated_time");
   const title = findMetaContent(html, "og:title");
-  const contentHtml = findElementByClass(html, "div", "spacebyte-txt");
-  return { title, publishedAt, body: contentHtml ? stripHtmlTags(contentHtml) : null };
+  // Individual article pages use a different template than the homepage's
+  // excerpt cards (spacebyte-txt only exists on the homepage summary
+  // view, confirmed by direct inspection of a real article page) -- so
+  // instead of guessing another CSS class blindly, anchor on literal text
+  // that's confirmed present on every article page: the byline line
+  // ("By [Author]|[date]|...Comments") and the "SHARE THIS!" heading.
+  const stripped = stripHtmlTags(html);
+  const startMarker = stripped.match(/\bBy\s+[^|]+\|[^|]+\|\s*\d+\s*Comments?/i);
+  const endIdx = stripped.indexOf("SHARE THIS!");
+  if (!startMarker || endIdx === -1 || endIdx <= startMarker.index) return { title, publishedAt, body: null };
+  const body = stripped.slice(startMarker.index + startMarker[0].length, endIdx).trim();
+  return { title, publishedAt, body: body || null };
 }
 function extractSitdArticle(html) {
   return { title: findMetaContent(html, "og:title"), publishedAt: findMetaContent(html, "article:published_time"), body: null }; // not yet implemented -- no confirmed selector
