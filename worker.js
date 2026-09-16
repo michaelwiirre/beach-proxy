@@ -826,7 +826,7 @@ async function handleForageEvidence(url, env) {
     if (!VALID_FORAGE_TYPES.includes(eff.forageType)) continue;
     if (!VALID_PRESENCE.includes(eff.presence)) continue;
 
-    const dedupeKey = `${row.article_url}|${eff.forageType}`;
+    const dedupeKey = `${row.article_url}|${eff.forageType}|${eff.presence}|${eff.concentration}|${eff.movement}|${eff.trend}|${eff.locationText}|${eff.supportingQuote}`;
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
 
