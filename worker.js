@@ -511,3 +511,410 @@ export default {
     return jsonResponse({ error: "Unknown route." }, 404);
   },
 };
+// ===========================================================================
+// PRIORITY 13D — REGIONAL FORAGE VALIDATION HARNESS (final consolidated
+// version). Data collection + independent LLM extraction + human review +
+// metrics only. NOT connected to scoring anywhere.
+// ===========================================================================
+const FORAGE_EXTRACTOR_VERSION = "BFR_FORAGE_EXTRACTOR_LLM_V2";
+const FORAGE_SOURCES_CONFIG = {
+  spacefish: { regionId: "space-coast", homepageUrl: "https://spacefish.com/" },
+  sitd: { regionId: "sebastian", homepageUrl: "https://www.sitd.us/our-world-famous-fishing-report" },
+  junobait: { regionId: "palm-beach-north", homepageUrl: "https://junobait.substack.com/archive" },
+};
+
+function forageNow() { return new Date().toISOString(); }
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function fetchText(url) {
+  const res = await fetch(url, { headers: { "User-Agent": "BeachFishingRadarProxy (research/validation)" } });
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+  return res.text();
+}
+async function recordSourceFailure(env, sourceId, reason) {
+  await env.TRIPS_DB.prepare(`UPDATE forage_source_health SET last_check_at=?, last_failure_at=?, last_failure_reason=? WHERE source_id=?`)
+    .bind(forageNow(), forageNow(), reason, sourceId).run();
+}
+function requireForageAuth(request, env) {
+  const header = request.headers.get("Authorization") || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!env.FORAGE_DEV_TOKEN || token !== env.FORAGE_DEV_TOKEN) return jsonResponse({ error: "Unauthorized. Pass 'Authorization: Bearer <FORAGE_DEV_TOKEN>'." }, 401);
+  return null;
+}
+
+// --- HTML parsing helpers (attribute-order/quote-style independent) ---
+function findAnchors(html, hrefPrefix) {
+  const results = []; const tagRe = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi; let m;
+  while ((m = tagRe.exec(html))) {
+    const hrefMatch = m[1].match(/href\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
+    if (!hrefMatch) continue;
+    const href = hrefMatch[1] ?? hrefMatch[2];
+    if (!href || !href.startsWith(hrefPrefix)) continue;
+    results.push({ href: href.split("#")[0].split("?")[0], innerHtml: m[2] });
+  }
+  return results;
+}
+function findMetaContent(html, propertyValue) {
+  const tagRe = /<meta\b([^>]*)>/gi; let m;
+  while ((m = tagRe.exec(html))) {
+    const propMatch = m[1].match(/(?:property|name)\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
+    const prop = propMatch ? (propMatch[1] ?? propMatch[2]) : null;
+    if (prop !== propertyValue) continue;
+    const contentMatch = m[1].match(/content\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
+    if (contentMatch) return contentMatch[1] ?? contentMatch[2];
+  }
+  return null;
+}
+function findElementByClass(html, tagName, classSubstring) {
+  const openRe = new RegExp(`<${tagName}\\b([^>]*)>`, "gi"); let m;
+  while ((m = openRe.exec(html))) {
+    const classMatch = m[1].match(/class\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
+    const classAttr = classMatch ? (classMatch[1] ?? classMatch[2]) : "";
+    if (!classAttr.split(/\s+/).some((c) => c === classSubstring)) continue;
+    let depth = 1, pos = openRe.lastIndex;
+    const walkRe = new RegExp(`<${tagName}\\b[^>]*>|<\\/${tagName}>`, "gi"); walkRe.lastIndex = pos;
+    let cm;
+    while ((cm = walkRe.exec(html))) {
+      if (cm[0].startsWith("</")) { depth--; if (depth === 0) return html.slice(pos, cm.index); }
+      else depth++;
+    }
+    return null;
+  }
+  return null;
+}
+function stripHtmlTags(html) {
+  return html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&#8217;/g, "'").replace(/&#8220;|&#8221;/g, '"')
+    .replace(/\s+/g, " ").trim();
+}
+function resolveUrl(maybeRelative, baseUrl) { try { return new URL(maybeRelative, baseUrl).toString(); } catch { return null; } }
+
+// --- Source adapters (candidate/unverified until you run debug-source) ---
+function extractSpacefishArticle(html) {
+  const publishedAt = findMetaContent(html, "article:published_time") || findMetaContent(html, "og:updated_time");
+  const title = findMetaContent(html, "og:title");
+  const contentHtml = findElementByClass(html, "div", "entry-content");
+  return { title, publishedAt, body: contentHtml ? stripHtmlTags(contentHtml) : null };
+}
+function extractSitdArticle(html) {
+  return { title: findMetaContent(html, "og:title"), publishedAt: findMetaContent(html, "article:published_time"), body: null }; // not yet implemented -- no confirmed selector
+}
+function extractJunoBaitArticle(html) {
+  const publishedAt = findMetaContent(html, "article:published_time");
+  const title = findMetaContent(html, "og:title");
+  const contentHtml = findElementByClass(html, "div", "available-content");
+  return { title, publishedAt, body: contentHtml ? stripHtmlTags(contentHtml) : null };
+}
+function discoverSpacefishArticles(html, baseUrl) {
+  const seen = new Set(), out = [];
+  for (const a of findAnchors(html, "https://spacefish.com/byte/")) { const u = resolveUrl(a.href, baseUrl); if (u && !seen.has(u)) { seen.add(u); out.push({ url: u }); } }
+  return out;
+}
+function discoverSitdArticles(html, baseUrl) {
+  const seen = new Set(), out = [];
+  for (const a of findAnchors(html, "https://www.sitd.us/")) {
+    const linkText = stripHtmlTags(a.innerHtml), u = resolveUrl(a.href, baseUrl);
+    if (u && !seen.has(u) && /week of|fishing report|mullet|inlet fishing/i.test(linkText)) { seen.add(u); out.push({ url: u, title: linkText }); }
+  }
+  return out;
+}
+function discoverJunoBaitArticles(html, baseUrl) {
+  const seen = new Set(), out = [];
+  for (const a of findAnchors(html, "https://junobait.substack.com/p/")) { const u = resolveUrl(a.href, baseUrl); if (u && !seen.has(u)) { seen.add(u); out.push({ url: u }); } }
+  return out;
+}
+const SOURCE_ADAPTERS = {
+  spacefish: { discover: discoverSpacefishArticles, extractArticle: extractSpacefishArticle },
+  sitd: { discover: discoverSitdArticles, extractArticle: extractSitdArticle },
+  junobait: { discover: discoverJunoBaitArticles, extractArticle: extractJunoBaitArticle },
+};
+
+// --- LLM extraction ---
+const FORAGE_EXTRACTION_SYSTEM_PROMPT = `You are a strict information-extraction tool for Florida surf-fishing reports. Your ONLY job is to extract forage/baitfish observations that are EXPLICITLY STATED in the article text. You are NOT a fishing expert and must NOT use fishing knowledge to fill gaps.
+
+Extract zero or more observations, one per distinct claim. For each, output an object with exactly these fields:
+- forageType: one of "mullet" | "menhaden" | "glass_minnows" | "pilchards" | "anchovies" | "sand_fleas" | "shrimp" | "general_baitfish"
+- presence: "present" | "scarce" | "absent" | "unknown"
+- concentration: "heavy" | "moderate" | "light" | null
+- movement: "southbound" | "northbound" | "moving_through" | "stationary" | null
+- trend: "increasing" | "stable" | "declining" | null
+- temporalScope: "current_or_recent" | "future_expectation" | "historical" | "generic_advice"
+- locationText: string or null (only if explicitly stated or established by a document section heading)
+- supportingQuote: the exact minimal substring of the article text that supports this observation (must be verbatim)
+- extractionConfidence: "high" | "moderate" | "low"
+
+STRICT PROHIBITIONS — never infer bait from predator activity, never convert future/conditional language into "current_or_recent", never convert historical language into "current_or_recent", never convert fishing advice or bait-shop availability into an observation unless the same clause also contains a genuine current observation, never invent a location, never apply seasonal knowledge as if it were a report. When uncertain, prefer "generic_advice" or "low" confidence over guessing. Output ONLY a JSON array, nothing else.`;
+
+async function callAnthropicExtractor(env, articleText, articleTitle) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": env.FORAGE_LLM_API_KEY, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: env.FORAGE_LLM_MODEL || "claude-sonnet-4-6", max_tokens: 1500, temperature: 0,
+      system: FORAGE_EXTRACTION_SYSTEM_PROMPT,
+      messages: [{ role: "user", content: `ARTICLE TITLE: ${articleTitle || "(none)"}\n\nARTICLE TEXT:\n${articleText}` }],
+    }),
+  });
+  if (!res.ok) throw new Error(`LLM provider HTTP ${res.status}`);
+  const json = await res.json();
+  return { rawResponseText: (json.content || []).map((b) => b.text || "").join(""), model: env.FORAGE_LLM_MODEL || "claude-sonnet-4-6" };
+}
+const VALID_FORAGE_TYPES = ["mullet","menhaden","glass_minnows","pilchards","anchovies","sand_fleas","shrimp","general_baitfish"];
+const VALID_PRESENCE = ["present","scarce","absent","unknown"];
+const VALID_CONCENTRATION = ["heavy","moderate","light",null];
+const VALID_MOVEMENT = ["southbound","northbound","moving_through","stationary",null];
+const VALID_TREND = ["increasing","stable","declining",null];
+const VALID_TEMPORAL = ["current_or_recent","future_expectation","historical","generic_advice"];
+const VALID_CONFIDENCE = ["high","moderate","low"];
+function validateExtraction(obj, articleRawText) {
+  const errors = [];
+  if (!VALID_FORAGE_TYPES.includes(obj.forageType)) errors.push("unsupported forageType");
+  if (!VALID_PRESENCE.includes(obj.presence)) errors.push("unsupported presence");
+  if (!VALID_CONCENTRATION.includes(obj.concentration)) errors.push("unsupported concentration");
+  if (!VALID_MOVEMENT.includes(obj.movement)) errors.push("unsupported movement");
+  if (!VALID_TREND.includes(obj.trend)) errors.push("unsupported trend");
+  if (!VALID_TEMPORAL.includes(obj.temporalScope)) errors.push("missing/unsupported temporalScope");
+  if (!VALID_CONFIDENCE.includes(obj.extractionConfidence)) errors.push("unsupported extractionConfidence");
+  if (!obj.supportingQuote || typeof obj.supportingQuote !== "string") errors.push("missing supportingQuote");
+  const schemaValid = errors.length === 0;
+  const quoteValid = schemaValid && articleRawText.includes(obj.supportingQuote);
+  if (schemaValid && !quoteValid) errors.push("supportingQuote not found verbatim");
+  return { schemaValid, quoteValid, errors };
+}
+
+// --- Discovery (creates articles + immutable revisions, fails closed) ---
+async function discoverAndStoreArticles(env, sourceId) {
+  const config = FORAGE_SOURCES_CONFIG[sourceId];
+  const adapter = SOURCE_ADAPTERS[sourceId];
+  await env.TRIPS_DB.prepare(`UPDATE forage_source_health SET last_check_at=? WHERE source_id=?`).bind(forageNow(), sourceId).run();
+
+  let homepageHtml;
+  try { homepageHtml = await fetchText(config.homepageUrl); }
+  catch (e) { await recordSourceFailure(env, sourceId, `homepage fetch failed: ${e.message}`); return { discovered: 0, error: e.message }; }
+  await env.TRIPS_DB.prepare(`UPDATE forage_source_health SET last_successful_fetch_at=? WHERE source_id=?`).bind(forageNow(), sourceId).run();
+
+  const candidates = adapter.discover(homepageHtml, config.homepageUrl);
+  if (candidates.length === 0) { await recordSourceFailure(env, sourceId, "zero articles discovered -- adapter likely wrong, NOT evidence of no bait activity"); return { discovered: 0 }; }
+
+  let newArticles = 0, newRevisions = 0;
+  for (const candidate of candidates) {
+    let article = await env.TRIPS_DB.prepare(`SELECT * FROM forage_source_articles WHERE article_url = ?`).bind(candidate.url).first();
+    if (!article) {
+      const ins = await env.TRIPS_DB.prepare(`INSERT INTO forage_source_articles (source_id, article_url, region_id, title, published_at, discovered_at) VALUES (?,?,?,?,?,?)`)
+        .bind(sourceId, candidate.url, config.regionId, candidate.title || null, null, forageNow()).run();
+      article = { id: ins.meta.last_row_id }; newArticles++;
+    }
+    let fetchStatus, body = null, publishedAt = null, title = candidate.title || null;
+    try {
+      const html = await fetchText(candidate.url);
+      const ex = adapter.extractArticle(html);
+      body = ex.body; publishedAt = ex.publishedAt; title = ex.title || title;
+      fetchStatus = body ? "ok" : "parse_failed";
+    } catch { fetchStatus = "fetch_failed"; }
+
+    const hash = await sha256Hex(body || candidate.url);
+    const existingRev = await env.TRIPS_DB.prepare(`SELECT id FROM forage_article_revisions WHERE article_id = ? AND content_hash = ?`).bind(article.id, hash).first();
+    if (existingRev) continue;
+    await env.TRIPS_DB.prepare(`INSERT INTO forage_article_revisions (article_id, fetched_at, raw_text, content_hash, fetch_status, extraction_status) VALUES (?,?,?,?,?,?)`)
+      .bind(article.id, forageNow(), body || "", hash, fetchStatus, fetchStatus === "ok" ? "awaiting_extraction" : "not_applicable").run();
+    newRevisions++;
+    if (publishedAt || title) await env.TRIPS_DB.prepare(`UPDATE forage_source_articles SET published_at = COALESCE(published_at, ?), title = COALESCE(title, ?) WHERE id = ?`).bind(publishedAt, title, article.id).run();
+    if (fetchStatus === "ok") await env.TRIPS_DB.prepare(`UPDATE forage_source_health SET last_article_discovered_at=? WHERE source_id=?`).bind(forageNow(), sourceId).run();
+  }
+  return { discovered: candidates.length, newArticles, newRevisions };
+}
+
+// --- Extraction (LLM only for genuinely new, successfully-fetched revisions) ---
+async function extractPendingArticles(env, limit = 10) {
+  if (!env.FORAGE_LLM_API_KEY) return { extracted: 0, skipped: "no FORAGE_LLM_API_KEY configured" };
+  const { results: pending } = await env.TRIPS_DB.prepare(
+    `SELECT r.*, a.source_id, a.region_id, a.title FROM forage_article_revisions r JOIN forage_source_articles a ON r.article_id = a.id
+     WHERE r.extraction_status = 'awaiting_extraction' AND r.fetch_status = 'ok' LIMIT ?`
+  ).bind(limit).all();
+
+  let processed = 0;
+  for (const revision of pending) {
+    const startedAt = forageNow();
+    let llmResult, runStatus = "success", errorMsg = null, observations = null;
+    try { llmResult = await callAnthropicExtractor(env, revision.raw_text, revision.title); }
+    catch (e) { runStatus = "provider_error"; errorMsg = e.message; }
+    if (runStatus === "success") {
+      try { observations = JSON.parse(llmResult.rawResponseText); if (!Array.isArray(observations)) throw new Error("not an array"); }
+      catch (e) { runStatus = "invalid_json"; errorMsg = e.message; }
+    }
+    const runRes = await env.TRIPS_DB.prepare(
+      `INSERT INTO forage_extraction_runs (article_revision_id, provider, model, extractor_version, started_at, completed_at, status, raw_response, observation_count, valid_observation_count, error) VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(revision.id, "anthropic", llmResult?.model || (env.FORAGE_LLM_MODEL || "claude-sonnet-4-6"), FORAGE_EXTRACTOR_VERSION, startedAt, forageNow(), runStatus, llmResult?.rawResponseText ?? null, observations?.length ?? null, null, errorMsg).run();
+    const runId = runRes.meta.last_row_id;
+
+    if (runStatus !== "success") {
+      await env.TRIPS_DB.prepare(`UPDATE forage_article_revisions SET extraction_status='extraction_failed' WHERE id=?`).bind(revision.id).run();
+      await recordSourceFailure(env, revision.source_id, `${runStatus}: ${errorMsg}`);
+      processed++; continue;
+    }
+    let validCount = 0;
+    for (const obs of observations) {
+      const { schemaValid, quoteValid, errors } = validateExtraction(obs, revision.raw_text);
+      if (schemaValid && quoteValid) validCount++;
+      await env.TRIPS_DB.prepare(
+        `INSERT INTO forage_extractions (article_revision_id, run_id, source_id, region_id, provider, model, extractor_version, extracted_at, forage_type, presence, concentration, movement, trend, temporal_scope, location_text, supporting_quote, extraction_confidence, quote_valid, schema_valid, raw_json, rejection_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      ).bind(revision.id, runId, revision.source_id, revision.region_id, "anthropic", llmResult.model, FORAGE_EXTRACTOR_VERSION, forageNow(),
+        obs.forageType ?? null, obs.presence ?? null, obs.concentration ?? null, obs.movement ?? null, obs.trend ?? null, obs.temporalScope ?? null,
+        obs.locationText ?? null, obs.supportingQuote ?? null, obs.extractionConfidence ?? null, quoteValid ? 1 : 0, schemaValid ? 1 : 0, JSON.stringify(obs), errors.length ? errors.join("; ") : null).run();
+    }
+    await env.TRIPS_DB.prepare(`UPDATE forage_extraction_runs SET valid_observation_count=? WHERE id=?`).bind(validCount, runId).run();
+    const newStatus = observations.length === 0 ? "extracted_no_evidence" : validCount > 0 ? "extracted_valid" : "extracted_quarantined";
+    await env.TRIPS_DB.prepare(`UPDATE forage_article_revisions SET extraction_status=? WHERE id=?`).bind(newStatus, revision.id).run();
+    await env.TRIPS_DB.prepare(`UPDATE forage_source_health SET last_successful_extraction_at=? WHERE source_id=?`).bind(forageNow(), revision.source_id).run();
+    processed++;
+  }
+  return { processed, checked: pending.length };
+}
+
+// --- Route handlers ---
+async function handleForageCheckSources(env) {
+  const results = {};
+  for (const sourceId of Object.keys(FORAGE_SOURCES_CONFIG)) results[sourceId] = await discoverAndStoreArticles(env, sourceId);
+  return jsonResponse({ ok: true, results });
+}
+async function handleForageExtractPending(env) { return jsonResponse({ ok: true, ...(await extractPendingArticles(env)) }); }
+async function handleForageHealth(env) { const { results } = await env.TRIPS_DB.prepare(`SELECT * FROM forage_source_health`).all(); return jsonResponse({ health: results }); }
+async function handleForageDebugSource(request, env) {
+  const body = await request.json();
+  const sourceId = body.sourceId;
+  if (!FORAGE_SOURCES_CONFIG[sourceId]) return jsonResponse({ error: "Unknown sourceId: " + Object.keys(FORAGE_SOURCES_CONFIG).join(", ") }, 400);
+  const config = FORAGE_SOURCES_CONFIG[sourceId];
+  const res = await fetch(config.homepageUrl, { headers: { "User-Agent": "BeachFishingRadarProxy (research/validation)" } });
+  const text = await res.text();
+  const candidates = SOURCE_ADAPTERS[sourceId].discover(text, config.homepageUrl);
+  return jsonResponse({ sourceId, homepageUrl: config.homepageUrl, httpStatus: res.status, contentType: res.headers.get("content-type"), responseBytes: text.length, candidateArticleCount: candidates.length, discoveredUrls: candidates.slice(0, 3).map((c) => c.url), rawResponse: text });
+}
+async function handleForageDebugRevision(request, env) {
+  const body = await request.json();
+  const revision = await env.TRIPS_DB.prepare(`SELECT * FROM forage_article_revisions WHERE id = ?`).bind(body.revisionId).first();
+  if (!revision) return jsonResponse({ error: "Unknown revisionId" }, 404);
+  return jsonResponse({ revision });
+}
+async function handleForagePendingReview(env, url) {
+  const filter = url.searchParams.get("filter") || "unreviewed";
+  const source = url.searchParams.get("source");
+  let query = `SELECT e.*, a.title, a.article_url, a.published_at, a.region_id as article_region
+    FROM forage_extractions e
+    JOIN forage_article_revisions rev ON e.article_revision_id = rev.id
+    JOIN forage_source_articles a ON rev.article_id = a.id
+    LEFT JOIN forage_extraction_reviews r ON r.extraction_id = e.id
+    WHERE e.schema_valid = 1 AND e.quote_valid = 1`;
+  const binds = [];
+  if (filter === "unreviewed") query += ` AND r.id IS NULL`;
+  if (source) { query += ` AND e.source_id = ?`; binds.push(source); }
+  query += ` ORDER BY e.id DESC LIMIT 50`;
+  const { results } = await env.TRIPS_DB.prepare(query).bind(...binds).all();
+  const { results: countRows } = await env.TRIPS_DB.prepare(
+    `SELECT COUNT(*) as c FROM forage_extractions e LEFT JOIN forage_extraction_reviews r ON r.extraction_id = e.id WHERE e.schema_valid=1 AND e.quote_valid=1 AND r.id IS NULL`
+  ).all();
+  return jsonResponse({ extractions: results, unreviewedCount: countRows[0]?.c ?? 0 });
+}
+async function handleForageSubmitReview(request, env) {
+  const body = await request.json();
+  if (!body.extractionId && !body.articleRevisionId) return jsonResponse({ error: "extractionId or articleRevisionId required" }, 400);
+  let articleRevisionId = body.articleRevisionId;
+  if (body.extractionId) {
+    const ex = await env.TRIPS_DB.prepare(`SELECT article_revision_id FROM forage_extractions WHERE id=?`).bind(body.extractionId).first();
+    articleRevisionId = ex?.article_revision_id;
+  }
+  await env.TRIPS_DB.prepare(
+    `INSERT INTO forage_extraction_reviews (extraction_id, article_revision_id, reviewed_at, review_type, overall_correct, truth_forage_type, truth_presence, truth_concentration, truth_movement, truth_trend, truth_temporal_scope, truth_location_text, truth_supporting_quote, reviewer_notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(body.extractionId ?? null, articleRevisionId, forageNow(), body.extractionId ? "extraction_review" : "missed_evidence",
+    body.overallCorrect ?? null, body.truthForageType ?? null, body.truthPresence ?? null, body.truthConcentration ?? null,
+    body.truthMovement ?? null, body.truthTrend ?? null, body.truthTemporalScope ?? null, body.truthLocationText ?? null, body.truthSupportingQuote ?? null, body.notes ?? null).run();
+  return jsonResponse({ ok: true });
+}
+async function handleForageMarkFullyReviewed(request, env) {
+  const body = await request.json();
+  await env.TRIPS_DB.prepare(`INSERT INTO forage_article_review_status (article_revision_id, fully_reviewed, fully_reviewed_at) VALUES (?, 1, ?) ON CONFLICT(article_revision_id) DO UPDATE SET fully_reviewed=1, fully_reviewed_at=?`)
+    .bind(body.articleRevisionId, forageNow(), forageNow()).run();
+  return jsonResponse({ ok: true });
+}
+async function handleForageMetrics(env, url) {
+  const confidenceFilter = url.searchParams.get("confidence");
+  let query = `SELECT r.*, e.presence as ai_presence, e.temporal_scope as ai_temporal_scope, e.concentration as ai_concentration, e.movement as ai_movement, e.trend as ai_trend, e.location_text as ai_location_text, e.extraction_confidence, e.source_id
+    FROM forage_extraction_reviews r JOIN forage_extractions e ON r.extraction_id = e.id WHERE r.review_type = 'extraction_review'`;
+  if (confidenceFilter === "high") query += ` AND e.extraction_confidence = 'high'`;
+  const { results: reviews } = await env.TRIPS_DB.prepare(query).all();
+  const aiCurrentPresent = reviews.filter((r) => r.ai_presence === "present" && r.ai_temporal_scope === "current_or_recent");
+  const currentPresencePrecision = aiCurrentPresent.length ? { precision: aiCurrentPresent.filter((r) => r.truth_presence === "present" && r.truth_temporal_scope === "current_or_recent").length / aiCurrentPresent.length, n: aiCurrentPresent.length } : null;
+  const dangerousFP = {
+    futureToCurrent: aiCurrentPresent.filter((r) => r.truth_temporal_scope === "future_expectation").length,
+    historicalToCurrent: aiCurrentPresent.filter((r) => r.truth_temporal_scope === "historical").length,
+    adviceToCurrent: aiCurrentPresent.filter((r) => r.truth_temporal_scope === "generic_advice").length,
+  };
+  function fieldAccuracy(aiKey, truthKey) {
+    const withTruth = reviews.filter((r) => r[truthKey] != null);
+    if (withTruth.length === 0) return null;
+    return { accuracy: withTruth.filter((r) => r[truthKey] === r[aiKey]).length / withTruth.length, n: withTruth.length };
+  }
+  return jsonResponse({
+    confidenceFilter: confidenceFilter || "high+moderate", totalReviewed: reviews.length, currentPresencePrecision, dangerousFalsePositives: dangerousFP,
+    temporalScopeAccuracy: fieldAccuracy("ai_temporal_scope", "truth_temporal_scope"), concentrationAccuracy: fieldAccuracy("ai_concentration", "truth_concentration"),
+    movementAccuracy: fieldAccuracy("ai_movement", "truth_movement"), trendAccuracy: fieldAccuracy("ai_trend", "truth_trend"), locationAccuracy: fieldAccuracy("ai_location_text", "truth_location_text"),
+  });
+}
+function forageReviewUiHtml() {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Forage Review</title>
+  <style>body{font-family:system-ui;max-width:700px;margin:20px auto;background:#0a0f14;color:#dce8ee}
+  .card{background:#0f1720;border:1px solid #1f3444;border-radius:8px;padding:14px;margin-bottom:12px}
+  .meta{color:#7590a0;font-size:12px;margin-bottom:8px} .quote{background:#070d14;padding:8px;border-radius:4px;font-style:italic;margin:8px 0}
+  .field{display:inline-block;margin-right:10px;font-size:13px} button{padding:6px 14px;border-radius:4px;border:none;cursor:pointer;margin-right:6px}
+  .correct{background:#17d9c4;color:#000} .incorrect{background:#ff6b6b;color:#000} #count{color:#f5a623}
+  input{background:#070d14;color:#dce8ee;border:1px solid #1f3444;padding:3px;margin:2px}</style></head>
+  <body><h2>Forage Extraction Review</h2>
+  <div><label>Dev token: <input id="token" type="password"></label> <button onclick="load()">Load</button></div>
+  <div id="count">Not loaded</div><div id="list"></div>
+  <script>
+  function authHeaders(){return {'Authorization':'Bearer '+document.getElementById('token').value};}
+  function el(tag,props,children){const n=document.createElement(tag);if(props)for(const k in props){if(k==='style')n.style.cssText=props[k];else n[k]=props[k];}for(const c of (children||[]))n.appendChild(typeof c==='string'?document.createTextNode(c):c);return n;}
+  async function load(){
+    const res=await fetch('/forage/review/pending?filter=unreviewed',{headers:authHeaders()});
+    const data=await res.json();
+    document.getElementById('count').textContent=(data.unreviewedCount??'?')+' awaiting review';
+    const list=document.getElementById('list'); list.innerHTML='';
+    for(const e of (data.extractions||[])) list.appendChild(buildCard(e));
+  }
+  function buildCard(e){
+    const card=el('div',{className:'card'});
+    const meta=el('div',{className:'meta'});
+    meta.append(document.createTextNode((e.source_id||'')+' | '+(e.published_at||'unknown date')+' | '+(e.article_region||'')+' | '));
+    if(typeof e.article_url==='string'&&e.article_url.startsWith('https://')) meta.appendChild(el('a',{href:e.article_url,target:'_blank',style:'color:#3e8fff'},[e.title||e.article_url]));
+    card.appendChild(meta);
+    card.appendChild(el('div',{className:'quote'},[e.supporting_quote||'']));
+    for(const v of [e.forage_type,e.presence,e.concentration||'-',e.movement||'-',e.trend||'-',e.temporal_scope,e.location_text||'no location',e.extraction_confidence+' confidence'])
+      card.appendChild(el('span',{className:'field'},[String(v)]));
+    card.appendChild(document.createElement('br'));
+    const showForm=(prefill)=>{
+      const form=el('div',{});
+      const fieldMap=[['forageType','forage_type'],['presence','presence'],['concentration','concentration'],['movement','movement'],['trend','trend'],['temporalScope','temporal_scope'],['locationText','location_text']];
+      const inputs={};
+      for(const [key,aiField] of fieldMap){const input=el('input',{value:e[aiField]||''});inputs[key]=input;form.appendChild(el('div',{},[key+': ',input]));}
+      const notes=el('input',{placeholder:'notes'}); form.appendChild(el('div',{},['notes: ',notes]));
+      const submit=el('button',{className:prefill?'correct':'incorrect'},[prefill?'Submit as correct':'Submit correction']);
+      submit.onclick=()=>review(e.id,prefill?1:0,{truthForageType:inputs.forageType.value||null,truthPresence:inputs.presence.value||null,truthConcentration:inputs.concentration.value||null,truthMovement:inputs.movement.value||null,truthTrend:inputs.trend.value||null,truthTemporalScope:inputs.temporalScope.value||null,truthLocationText:inputs.locationText.value||null,truthSupportingQuote:e.supporting_quote,notes:notes.value||null});
+      form.appendChild(submit); card.appendChild(form);
+    };
+    const correctBtn=el('button',{className:'correct'},['Correct']); correctBtn.onclick=()=>{card.querySelectorAll('button').forEach(b=>b.remove());showForm(true);};
+    const incorrectBtn=el('button',{className:'incorrect'},['Incorrect']); incorrectBtn.onclick=()=>{card.querySelectorAll('button').forEach(b=>b.remove());showForm(false);};
+    card.appendChild(correctBtn); card.appendChild(incorrectBtn);
+    return card;
+  }
+  async function review(id,overallCorrect,truth){
+    await fetch('/forage/review/submit',{method:'POST',headers:{'Content-Type':'application/json',...authHeaders()},body:JSON.stringify({extractionId:id,overallCorrect,...truth})});
+    load();
+  }
+  </script></body></html>`;
+}
+
+async function forageScheduledHandler(env) {
+  for (const sourceId of Object.keys(FORAGE_SOURCES_CONFIG)) await discoverAndStoreArticles(env, sourceId);
+  await extractPendingArticles(env, 10);
+}
