@@ -676,9 +676,15 @@ async function extractPendingArticles(env, limit = 10) {
     try { llmResult = await callAnthropicExtractor(env, revision.raw_text, revision.title); }
     catch (e) { runStatus = "provider_error"; errorMsg = e.message; }
     if (runStatus === "success") {
-      try { observations = JSON.parse(llmResult.rawResponseText); if (!Array.isArray(observations)) throw new Error("not an array"); }
-      catch (e) { runStatus = "invalid_json"; errorMsg = e.message; }
-    }
+  try {
+    // Strip markdown code fences if present -- the prompt asks for raw
+    // JSON only, but the model sometimes wraps it anyway.
+    const cleaned = llmResult.rawResponseText.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    observations = JSON.parse(cleaned);
+    if (!Array.isArray(observations)) throw new Error("not an array");
+  }
+  catch (e) { runStatus = "invalid_json"; errorMsg = e.message; }
+}
     const runRes = await env.TRIPS_DB.prepare(
       `INSERT INTO forage_extraction_runs (article_revision_id, provider, model, extractor_version, started_at, completed_at, status, raw_response, observation_count, valid_observation_count, error) VALUES (?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(revision.id, "anthropic", llmResult?.model || (env.FORAGE_LLM_MODEL || "claude-sonnet-4-6"), FORAGE_EXTRACTOR_VERSION, startedAt, forageNow(), runStatus, llmResult?.rawResponseText ?? null, observations?.length ?? null, null, errorMsg).run();
