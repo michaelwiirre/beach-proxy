@@ -755,19 +755,38 @@ async function handleForageEvidence(url, env) {
   if (!regionId) return jsonResponse({ supported: false, evidence: [] });
 
   const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+  // Priority 13 correction (item 1): do NOT filter on e.temporal_scope
+  // here. A human review can change temporal scope, and filtering on the
+  // AI's original value before that correction is applied would let a
+  // human-corrected future/historical/advice extraction still pass. Only
+  // gates that are never subject to human override (schema/quote
+  // validity, confidence, freshness) apply at the SQL level; temporal
+  // scope eligibility is checked below, against the EFFECTIVE
+  // (human-truth-aware) observation.
+  //
+  // Item 2: the subquery ensures only the single LATEST review per
+  // extraction joins, by reviewed_at then id as a deterministic
+  // tiebreaker -- never lets multiple reviews duplicate a row.
   const { results } = await env.TRIPS_DB.prepare(`
-    SELECT e.id, e.forage_type, e.presence, e.concentration, e.movement, e.trend,
+    SELECT e.id, e.forage_type, e.presence, e.concentration, e.movement, e.trend, e.temporal_scope,
            e.location_text, e.supporting_quote, e.extraction_confidence,
            a.article_url, a.published_at, a.source_id,
            rv.overall_correct, rv.truth_forage_type, rv.truth_presence, rv.truth_concentration,
-           rv.truth_movement, rv.truth_trend, rv.truth_location_text, rv.truth_supporting_quote
+           rv.truth_movement, rv.truth_trend, rv.truth_temporal_scope, rv.truth_location_text, rv.truth_supporting_quote
     FROM forage_extractions e
     JOIN forage_article_revisions rev ON e.article_revision_id = rev.id
     JOIN forage_source_articles a ON rev.article_id = a.id
-    LEFT JOIN forage_extraction_reviews rv ON rv.extraction_id = e.id
+    LEFT JOIN (
+      SELECT r1.* FROM forage_extraction_reviews r1
+      WHERE r1.review_type = 'extraction_review'
+        AND r1.id = (
+          SELECT r2.id FROM forage_extraction_reviews r2
+          WHERE r2.extraction_id = r1.extraction_id AND r2.review_type = 'extraction_review'
+          ORDER BY r2.reviewed_at DESC, r2.id DESC LIMIT 1
+        )
+    ) rv ON rv.extraction_id = e.id
     WHERE e.region_id = ?
       AND e.schema_valid = 1 AND e.quote_valid = 1
-      AND e.temporal_scope = 'current_or_recent'
       AND e.extraction_confidence IN ('high', 'moderate')
       AND a.published_at IS NOT NULL AND a.published_at >= ?
     ORDER BY a.published_at DESC
@@ -776,19 +795,38 @@ async function handleForageEvidence(url, env) {
   const seen = new Set();
   const evidence = [];
   for (const row of results) {
-    // Human review precedence (item 9): incorrect + no usable correction -> hide entirely.
-    if (row.overall_correct === 0 && !row.truth_forage_type) continue;
-    const useTruth = row.overall_correct === 0;
+    const hasReview = row.overall_correct !== null && row.overall_correct !== undefined;
+    const isIncorrect = row.overall_correct === 0;
+    // Incorrect with no usable correction -> hide entirely (unchanged rule).
+    if (isIncorrect && !row.truth_forage_type) continue;
 
-    const forageType = useTruth ? row.truth_forage_type : row.forage_type;
-    const presence = useTruth ? row.truth_presence : row.presence;
-    const concentration = useTruth ? row.truth_concentration : row.concentration;
-    const movement = useTruth ? row.truth_movement : row.movement;
-    const trend = useTruth ? row.truth_trend : row.trend;
-    const locationText = useTruth ? row.truth_location_text : row.location_text;
-    const quote = useTruth ? (row.truth_supporting_quote || row.supporting_quote) : row.supporting_quote;
+    // Human truth ALWAYS wins when a review exists -- for "correct"
+    // reviews, truth_* was submitted as an explicit accepted copy of the
+    // AI's own values (built that way in the review UI), so using truth_*
+    // whenever hasReview is true is both correct and simpler than
+    // branching on overall_correct again here.
+    const eff = hasReview
+      ? {
+          forageType: row.truth_forage_type, presence: row.truth_presence, concentration: row.truth_concentration,
+          movement: row.truth_movement, trend: row.truth_trend, temporalScope: row.truth_temporal_scope,
+          locationText: row.truth_location_text, supportingQuote: row.truth_supporting_quote || row.supporting_quote,
+        }
+      : {
+          forageType: row.forage_type, presence: row.presence, concentration: row.concentration,
+          movement: row.movement, trend: row.trend, temporalScope: row.temporal_scope,
+          locationText: row.location_text, supportingQuote: row.supporting_quote,
+        };
 
-    const dedupeKey = `${row.article_url}|${forageType}`;
+    // Effective eligibility -- checked AFTER human truth is applied. This
+    // is the actual fix: a human-corrected temporalScope of
+    // "future_expectation"/"historical"/"generic_advice" is excluded
+    // here even if the AI's original e.temporal_scope was
+    // "current_or_recent".
+    if (eff.temporalScope !== "current_or_recent") continue;
+    if (!VALID_FORAGE_TYPES.includes(eff.forageType)) continue;
+    if (!VALID_PRESENCE.includes(eff.presence)) continue;
+
+    const dedupeKey = `${row.article_url}|${eff.forageType}`;
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
 
@@ -796,8 +834,9 @@ async function handleForageEvidence(url, env) {
     if (!freshnessLabel) continue;
 
     evidence.push({
-      forageType, presence, concentration, movement, trend, locationText,
-      supportingQuote: quote,
+      forageType: eff.forageType, presence: eff.presence, concentration: eff.concentration,
+      movement: eff.movement, trend: eff.trend, locationText: eff.locationText,
+      supportingQuote: eff.supportingQuote,
       sourceName: FORAGE_SOURCE_DISPLAY_NAMES[row.source_id] || row.source_id,
       region: FORAGE_REGION_DISPLAY_NAMES[regionId] || regionId,
       publishedAt: row.published_at,
