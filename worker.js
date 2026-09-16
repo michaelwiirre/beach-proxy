@@ -507,6 +507,17 @@ export default {
       return handleSnapshotSave(request, env);
     }
     if (url.pathname === "/snapshots/list") return handleSnapshotList(url, env);
+          const FORAGE_DEV_ROUTES = ["/forage/check-sources","/forage/extract-pending","/forage/debug-source","/forage/debug-revision","/forage/review","/forage/review/pending","/forage/review/submit","/forage/review/mark-fully-reviewed","/forage/metrics","/forage/health"];
+    if (FORAGE_DEV_ROUTES.includes(url.pathname)) { const authError = requireForageAuth(request, env); if (authError) return authError; }
+    if (url.pathname === "/forage/check-sources") { if (request.method !== "POST") return jsonResponse({ error: "POST only" }, 405); return handleForageCheckSources(env); }
+    if (url.pathname === "/forage/extract-pending") { if (request.method !== "POST") return jsonResponse({ error: "POST only" }, 405); return handleForageExtractPending(env); }
+    if (url.pathname === "/forage/debug-source") { if (request.method !== "POST") return jsonResponse({ error: "POST only" }, 405); return handleForageDebugSource(request, env); }
+    if (url.pathname === "/forage/debug-revision") { if (request.method !== "POST") return jsonResponse({ error: "POST only" }, 405); return handleForageDebugRevision(request, env); }
+    if (url.pathname === "/forage/review") return new Response(forageReviewUiHtml(), { headers: { "Content-Type": "text/html", ...CORS_HEADERS } });
+    if (url.pathname === "/forage/review/pending") return handleForagePendingReview(env, url);
+    if (url.pathname === "/forage/review/submit") { if (request.method !== "POST") return jsonResponse({ error: "POST only" }, 405); return handleForageSubmitReview(request, env); }
+    if (url.pathname === "/forage/review/mark-fully-reviewed") { if (request.method !== "POST") return jsonResponse({ error: "POST only" }, 405); return handleForageMarkFullyReviewed(request, env); }
+    if (url.pathname === "/forage/metrics") return handleForageMetrics(env, url);
 
     return jsonResponse({ error: "Unknown route." }, 404);
   },
