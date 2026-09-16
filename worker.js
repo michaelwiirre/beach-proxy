@@ -833,7 +833,7 @@ async function handleForageEvidence(url, env) {
     const freshnessLabel = computeForageFreshnessLabel(row.published_at);
     if (!freshnessLabel) continue;
 
-    evidence.push({
+        evidence.push({
       forageType: eff.forageType, presence: eff.presence, concentration: eff.concentration,
       movement: eff.movement, trend: eff.trend, locationText: eff.locationText,
       supportingQuote: eff.supportingQuote,
@@ -842,8 +842,8 @@ async function handleForageEvidence(url, env) {
       publishedAt: row.published_at,
       freshnessLabel,
       articleUrl: row.article_url,
+      reviewStatus: hasReview ? "human_reviewed" : "ai_extracted", // never implies ai_extracted is verified -- just labels its provenance
     });
-  }
   return jsonResponse({ supported: true, regionId, evidence: evidence.slice(0, 10) });
 }
 
