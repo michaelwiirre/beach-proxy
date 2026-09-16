@@ -523,7 +523,7 @@ function resolveUrl(maybeRelative, baseUrl) { try { return new URL(maybeRelative
 function extractSpacefishArticle(html) {
   const publishedAt = findMetaContent(html, "article:published_time") || findMetaContent(html, "og:updated_time");
   const title = findMetaContent(html, "og:title");
-  const contentHtml = findElementByClass(html, "div", "entry-content");
+  const contentHtml = findElementByClass(html, "div", "spacebyte-txt");
   return { title, publishedAt, body: contentHtml ? stripHtmlTags(contentHtml) : null };
 }
 function extractSitdArticle(html) {
