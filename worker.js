@@ -930,7 +930,7 @@ export default {
       const authError = requireForageAuth(request, env);
       if (authError) return authError;
     }
-    if (url.pathname === "/forage/check-sources") { if (request.method !== "POST") return jsonResponse({ error: "POST only" }, 405); return handleForageCheckSources(env); }
+if (url.pathname === "/forage/check-sources") { return handleForageCheckSources(env); }
     if (url.pathname === "/forage/extract-pending") { if (request.method !== "POST") return jsonResponse({ error: "POST only" }, 405); return handleForageExtractPending(env); }
     if (url.pathname === "/forage/debug-source") { if (request.method !== "POST") return jsonResponse({ error: "POST only" }, 405); return handleForageDebugSource(request, env); }
     if (url.pathname === "/forage/debug-revision") { if (request.method !== "POST") return jsonResponse({ error: "POST only" }, 405); return handleForageDebugRevision(request, env); }
