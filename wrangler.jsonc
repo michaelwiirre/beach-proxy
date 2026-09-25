@@ -1,0 +1,14 @@
+{
+  "name": "beach-proxy",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-24",
+  "cache": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "TRIPS_DB",
+      "database_id": "63143fbc-1f35-443a-be6f-d62eb7ca90f3"
+    }
+  ]
+}
